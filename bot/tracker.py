@@ -1,6 +1,7 @@
 """Live + historical tracker for published memecoin calls."""
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -12,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application
 
-from bot import db
+from bot import db, stats
 
 
 logger = logging.getLogger(__name__)
@@ -485,30 +486,42 @@ def _milestone_message(
     source: str,
 ) -> str:
     multiple = valuation / float(call["entry_valuation"])
-    metric = "שווי שוק" if call["valuation_type"] == "marketCap" else "FDV"
+    metric = "MC" if call["valuation_type"] == "marketCap" else "FDV"
+    symbol = html.escape(str(call["symbol"]))
 
     if source == "history":
-        value_label = f"🏆 {metric} בשיא מאז ההמלצה"
-        profit_label = "🔥 רווח בשיא"
-        source_line = "🕒 היעד אומת מהיסטוריית OHLCV מאז פרסום ההמלצה."
+        status_title = "🏆 <b>שיא מאומת מההיסטוריה</b>"
+        value_label = "ATH מאז ההמלצה"
+        detail_line = "🕒 <i>היעד אומת מהיסטוריית OHLCV מאז פרסום ה־Call.</i>"
     else:
-        value_label = f"📈 {metric} נוכחי"
-        profit_label = "🟢 רווח נוכחי"
-        source_line = None
+        status_title = "⚡ <b>היעד הושג עכשיו</b>"
+        value_label = "שווי נוכחי"
+        detail_line = None
 
     parts = [
-        f"🔥 {call['symbol']} הגיע ל-{milestone}% רווח!",
+        "💥💥💥 <b>יעד רווח הושג!</b> 💥💥💥",
+        "━━━━━━━━━━━━━━━━━━",
+        f"🚀 <b>${symbol}  •  +{milestone}%</b>",
+        f"🔥 <b>{multiple:.2f}X מאז ההמלצה</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        status_title,
         "",
-        f"🚀 {multiple:.2f}X מאז ההמלצה",
-        "",
-        f"💰 {metric} בהמלצה: {_fmt_usd(call['entry_valuation'])}",
-        f"{value_label}: {_fmt_usd(valuation)}",
-        f"{profit_label}: +{profit:.1f}%",
-        f"⏱ זמן מאז ההמלצה: {_duration_text(call['call_time'])}",
+        f"💰 <b>{metric} בפרסום:</b> {_fmt_usd(call['entry_valuation'])}",
+        f"🏆 <b>{value_label}:</b> {_fmt_usd(valuation)}",
+        f"📈 <b>רווח:</b> +{profit:.1f}%",
+        f"⏱ <b>זמן מההמלצה:</b> {_duration_text(call['call_time'])}",
     ]
-    if source_line:
-        parts.append(source_line)
-    parts.extend(["", WARNING_TEXT])
+
+    if detail_line:
+        parts.extend(["", detail_line])
+
+    parts.extend([
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "⚠️ <i>אזהרה: מסחר בקריפטו וב־Memecoins הוא תנודתי ומסוכן ועלול "
+        "להביא לאובדן מלא של ההשקעה. אין בפרסום משום ייעוץ או המלצה אישית. "
+        "כל החלטת מסחר היא באחריות המשתמש בלבד.</i>",
+    ])
     return "\n".join(parts)
 
 
@@ -538,15 +551,23 @@ async def _publish_milestone(
     if not claimed:
         return False
 
-    bot_username = application.bot.username
-    if not bot_username:
-        me = await application.bot.get_me()
-        bot_username = me.username
-
-    keyboard = _milestone_keyboard(
-        bot_username=bot_username,
-        dex_url=dex_url or call["dexscreener_url"],
-    )
+    try:
+        await stats.refresh_all_stats_pages(
+            application,
+            pool,
+            channel_chat_id=int(call["channel_chat_id"]),
+        )
+        keyboard = await stats.recommendation_keyboard(
+            pool,
+            dex_url=dex_url or call["dexscreener_url"],
+        )
+    except Exception:
+        logger.exception("Could not refresh channel list pages before milestone")
+        fallback_rows = []
+        final_dex_url = dex_url or call["dexscreener_url"]
+        if final_dex_url:
+            fallback_rows.append([InlineKeyboardButton("📈 DexScreener", url=final_dex_url)])
+        keyboard = InlineKeyboardMarkup(fallback_rows) if fallback_rows else None
 
     try:
         sent = await application.bot.send_message(
@@ -558,6 +579,7 @@ async def _publish_milestone(
                 valuation,
                 source=source,
             ),
+            parse_mode="HTML",
             reply_markup=keyboard,
             disable_web_page_preview=True,
         )

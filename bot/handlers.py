@@ -1,6 +1,7 @@
 """Telegram update handlers for the memecoin calls bot."""
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -24,7 +25,7 @@ from telegram.ext import (
     filters,
 )
 
-from bot import cache, db
+from bot import cache, db, stats
 
 
 logger = logging.getLogger(__name__)
@@ -329,17 +330,49 @@ def _preview_text(call: dict) -> str:
     )
 
 
-def _channel_call_text(call: dict) -> str:
-    metric = "שווי שוק" if call["valuation_type"] == "marketCap" else "FDV"
+def _daily_leaders_text(leaders) -> str:
+    if not leaders:
+        return (
+            "🏆 <b>המובילים היומיים</b>\n"
+            "<i>עדיין אין מספיק המלצות היום.</i>"
+        )
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 <b>המובילים היומיים</b>"]
+    for index, row in enumerate(leaders, start=1):
+        ath = float(row["highest_valuation"] or row["entry_valuation"])
+        profit = float(row["highest_profit_percent"] or 0.0)
+        symbol = html.escape(str(row["symbol"]))
+        medal = medals[index - 1] if index <= len(medals) else f"{index}."
+        lines.append(
+            f"{medal} <b>${symbol}</b>  •  <b>{profit:+.0f}%</b>  •  ATH {_fmt_usd(ath)}"
+        )
+    return "\n".join(lines)
+
+
+def _channel_call_text(call: dict, leaders=None) -> str:
+    metric = "MC" if call["valuation_type"] == "marketCap" else "FDV"
+    name = html.escape(str(call["name"]))
+    symbol = html.escape(str(call["symbol"]))
+    token_address = html.escape(str(call["token_address"]))
+    leaders_block = _daily_leaders_text(leaders or [])
+
     return (
-        "🚨 המלצה חדשה\n\n"
-        f"🪙 {call['name']} (${call['symbol']})\n"
-        f"💰 {metric} בזמן ההמלצה: {_fmt_usd(call['entry_valuation'])}\n"
-        f"💵 מחיר בזמן ההמלצה: {_fmt_usd(call['price_usd'])}\n"
-        f"💧 נזילות: {_fmt_usd(call['liquidity'])}\n"
-        f"⏱ גיל המטבע: {_age_text(call['pair_created_at'])}\n\n"
-        f"📍 CA:\n{call['token_address']}\n\n"
-        "⚠️ אזהרה: מסחר בקריפטו וב־Memecoins הוא תנודתי ומסוכן ועלול להביא לאובדן מלא של ההשקעה. אין בפרסום משום ייעוץ או המלצה אישית. כל החלטת מסחר היא באחריות המשתמש בלבד."
+        "🚨🚨 <b>CALL חדש</b> 🚨🚨\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🪙 <b>{name}  •  ${symbol}</b>\n\n"
+        f"💰 <b>{metric} בפרסום:</b> {_fmt_usd(call['entry_valuation'])}\n"
+        f"💵 <b>מחיר:</b> {_fmt_usd(call['price_usd'])}\n"
+        f"💧 <b>נזילות:</b> {_fmt_usd(call['liquidity'])}\n"
+        f"⏱ <b>גיל המטבע:</b> {_age_text(call['pair_created_at'])}\n\n"
+        "📍 <b>CA</b>\n"
+        f"<code>{token_address}</code>\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"{leaders_block}\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "⚠️ <i>אזהרה: מסחר בקריפטו וב־Memecoins הוא תנודתי ומסוכן ועלול להביא "
+        "לאובדן מלא של ההשקעה. אין בפרסום משום ייעוץ או המלצה אישית. "
+        "כל החלטת מסחר היא באחריות המשתמש בלבד.</i>"
     )
 
 
@@ -470,6 +503,19 @@ async def echo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await message.reply_text("שלח כתובת CA תקינה של Solana.")
         return
 
+    pool = context.bot_data.get(DB_KEY)
+    if pool is not None:
+        existing = await db.get_existing_call(pool, text)
+        if existing is not None:
+            await message.reply_text(
+                "⛔ המטבע הזה כבר פורסם בעבר ולכן לא ניתן לפרסם אותו שוב.\n\n"
+                f"${existing['symbol']} | Call ID: {existing['id']}\n"
+                f"MC/FDV בפרסום: {_fmt_usd(existing['entry_valuation'])}\n"
+                f"ATH מאז הפרסום: {_fmt_usd(existing['highest_valuation'])}\n"
+                f"שיא: {float(existing['highest_profit_percent'] or 0):+.0f}%"
+            )
+            return
+
     status = await message.reply_text("🔍 בודק את המטבע ב-DexScreener...")
 
     try:
@@ -539,26 +585,36 @@ async def publish_call_callback(
         )
         return
 
+    # Final duplicate guard immediately before publication.
+    existing = await db.get_existing_call(pool, call["token_address"])
+    if existing is not None:
+        context.user_data.pop("pending_call", None)
+        await query.edit_message_text(
+            "⛔ המטבע הזה כבר פורסם בעבר ולא ניתן לפרסם אותו שוב.\n\n"
+            f"${existing['symbol']} | Call ID: {existing['id']}\n"
+            f"MC/FDV בפרסום: {_fmt_usd(existing['entry_valuation'])}\n"
+            f"ATH מאז הפרסום: {_fmt_usd(existing['highest_valuation'])}"
+        )
+        return
+
     target = _channel_target()
     if target is None:
         await query.edit_message_text("❌ CHANNEL_ID לא מוגדר ב-Railway.")
         return
 
-    bot_username = context.bot.username
-    if not bot_username:
-        me = await context.bot.get_me()
-        bot_username = me.username
-
-    keyboard = _lists_keyboard(
-        bot_username=bot_username,
-        dex_url=call.get("dex_url"),
-    )
+    # Publish first with a temporary DexScreener-only button. After the call is
+    # saved, channel-native daily/weekly/all-time list buttons are attached.
+    temp_rows = []
+    if call.get("dex_url"):
+        temp_rows.append([InlineKeyboardButton("📈 DexScreener", url=call["dex_url"])])
+    temp_keyboard = InlineKeyboardMarkup(temp_rows) if temp_rows else None
 
     try:
         sent = await context.bot.send_message(
             chat_id=target,
-            text=_channel_call_text(call),
-            reply_markup=keyboard,
+            text=_channel_call_text(call, []),
+            parse_mode="HTML",
+            reply_markup=temp_keyboard,
             disable_web_page_preview=True,
         )
     except Exception as exc:
@@ -583,6 +639,19 @@ async def publish_call_callback(
             channel_chat_id=sent.chat.id,
             telegram_message_id=sent.message_id,
         )
+    except db.DuplicateCallError:
+        try:
+            await context.bot.delete_message(
+                chat_id=sent.chat.id,
+                message_id=sent.message_id,
+            )
+        except Exception:
+            logger.exception("Could not delete duplicate channel message")
+        context.user_data.pop("pending_call", None)
+        await query.edit_message_text(
+            "⛔ המטבע כבר פורסם בעבר. הפרסום החדש בוטל אוטומטית."
+        )
+        return
     except Exception as exc:
         logger.exception("Saving call failed")
         try:
@@ -599,13 +668,37 @@ async def publish_call_callback(
         )
         return
 
+    # Create/update permanent list posts inside the channel, then point the call
+    # buttons directly to those posts. Subscribers never need to open the bot.
+    try:
+        await stats.refresh_all_stats_pages(
+            context.application,
+            pool,
+            channel_chat_id=sent.chat.id,
+        )
+        leaders = await db.get_daily_leaders(pool, limit=3)
+        final_keyboard = await stats.recommendation_keyboard(
+            pool,
+            dex_url=call.get("dex_url"),
+        )
+        await context.bot.edit_message_text(
+            chat_id=sent.chat.id,
+            message_id=sent.message_id,
+            text=_channel_call_text(call, leaders),
+            parse_mode="HTML",
+            reply_markup=final_keyboard,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        logger.exception("Call published, but stats/leaders refresh failed")
+
     context.user_data.pop("pending_call", None)
 
     await query.edit_message_text(
         "✅ ההמלצה פורסמה ונכנסה למעקב אוטומטי.\n\n"
         f"{call['name']} (${call['symbol']})\n"
         f"Call ID: {call_id}\n"
-        "הבוט יבדוק אותה אוטומטית ויפרסם יעדי 100%, 200%, 300% וכו׳."
+        "הכפתורים ברשומה מפנים לרשימות בתוך הערוץ עצמו."
     )
 
 

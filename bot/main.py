@@ -6,7 +6,7 @@ import logging
 from telegram import Update
 from telegram.ext import Application, ApplicationBuilder
 
-from bot import cache, db, tracker
+from bot import cache, db, stats, tracker
 from bot.config import Settings
 from bot.handlers import (
     DB_KEY,
@@ -19,6 +19,7 @@ from bot.handlers import (
 
 logger = logging.getLogger(__name__)
 TRACKER_TASK_KEY = "tracker_task"
+STATS_TASK_KEY = "stats_task"
 
 
 def configure_logging(level_name: str) -> None:
@@ -55,15 +56,20 @@ def build_application(settings: Settings) -> Application:
             tracker.tracker_loop(application),
             name="memecoin-call-tracker",
         )
+        application.bot_data[STATS_TASK_KEY] = asyncio.create_task(
+            stats.stats_refresh_loop(application),
+            name="channel-stats-refresh",
+        )
 
     async def on_shutdown(application: Application) -> None:
-        task = application.bot_data.get(TRACKER_TASK_KEY)
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        for task_key in (TRACKER_TASK_KEY, STATS_TASK_KEY):
+            task = application.bot_data.get(task_key)
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
         pool = application.bot_data.get(DB_KEY)
         if pool is not None:

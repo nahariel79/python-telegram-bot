@@ -8,6 +8,11 @@ import asyncpg
 
 logger = logging.getLogger(__name__)
 
+
+class DuplicateCallError(Exception):
+    """Raised when a token has already been published as a call."""
+
+
 POOL_MIN_SIZE = 1
 POOL_MAX_SIZE = 10
 COMMAND_TIMEOUT = 10.0
@@ -78,6 +83,18 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 """
 
+CREATE_STATS_PAGES_TABLE = """
+CREATE TABLE IF NOT EXISTS stats_pages (
+    period          TEXT NOT NULL CHECK (period IN ('day', 'week', 'all')),
+    page_number     INTEGER NOT NULL,
+    channel_chat_id BIGINT NOT NULL,
+    message_id      BIGINT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (period, page_number)
+);
+"""
+
 CREATE_CALLS_ACTIVE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_calls_active ON calls(active) WHERE active = TRUE;
 """
@@ -115,6 +132,39 @@ MIGRATIONS: list[tuple[str, str]] = [
         WHERE current_dexscreener_url IS NULL;
         """,
     ),
+    (
+        "2026_10_11_stage6_channel_stats_and_duplicate_guard",
+        """
+        CREATE TABLE IF NOT EXISTS stats_pages (
+            period          TEXT NOT NULL CHECK (period IN ('day', 'week', 'all')),
+            page_number     INTEGER NOT NULL,
+            channel_chat_id BIGINT NOT NULL,
+            message_id      BIGINT NOT NULL,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (period, page_number)
+        );
+
+        CREATE OR REPLACE FUNCTION reject_duplicate_call_token()
+        RETURNS trigger AS $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM calls
+                WHERE lower(token_address) = lower(NEW.token_address)
+            ) THEN
+                RAISE EXCEPTION 'token_already_called' USING ERRCODE = '23505';
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+
+        DROP TRIGGER IF EXISTS trg_reject_duplicate_call_token ON calls;
+        CREATE TRIGGER trg_reject_duplicate_call_token
+        BEFORE INSERT ON calls
+        FOR EACH ROW EXECUTE FUNCTION reject_duplicate_call_token();
+        """,
+    ),
+
 ]
 
 UPSERT_USER = """
@@ -160,6 +210,7 @@ async def create_pool(dsn: str) -> asyncpg.Pool:
         await conn.execute(CREATE_USERS_TABLE)
         await conn.execute(CREATE_CALLS_TABLE)
         await conn.execute(CREATE_MILESTONES_TABLE)
+        await conn.execute(CREATE_STATS_PAGES_TABLE)
         await _apply_migrations(conn)
         await conn.execute(CREATE_CALLS_ACTIVE_INDEX)
         await conn.execute(CREATE_HISTORY_DUE_INDEX)
@@ -197,47 +248,29 @@ async def insert_call(
     channel_chat_id: int,
     telegram_message_id: int,
 ) -> int:
-    """Persist a newly published call and return its database ID."""
-    return int(
-        await pool.fetchval(
+    """Persist a new call. Duplicate token addresses are rejected permanently."""
+    try:
+        value = await pool.fetchval(
             """
             INSERT INTO calls (
-                token_address,
-                token_name,
-                symbol,
-                pair_address,
-                dexscreener_url,
-                valuation_type,
-                entry_price,
-                entry_valuation,
-                current_price,
-                current_valuation,
-                highest_valuation,
-                ath_price,
-                ath_source,
-                current_pair_address,
-                current_dexscreener_url,
-                last_pair_refresh_at,
-                channel_chat_id,
-                telegram_message_id
+                token_address, token_name, symbol, pair_address, dexscreener_url,
+                valuation_type, entry_price, entry_valuation, current_price,
+                current_valuation, highest_valuation, ath_price, ath_source,
+                current_pair_address, current_dexscreener_url, last_pair_refresh_at,
+                channel_chat_id, telegram_message_id
             )
             VALUES (
                 $1,$2,$3,$4,$5,$6,$7,$8,$7,$8,$8,$7,'entry',$4,$5,now(),$9,$10
             )
             RETURNING id;
             """,
-            token_address,
-            token_name,
-            symbol,
-            pair_address,
-            dexscreener_url,
-            valuation_type,
-            entry_price,
-            entry_valuation,
-            channel_chat_id,
+            token_address, token_name, symbol, pair_address, dexscreener_url,
+            valuation_type, entry_price, entry_valuation, channel_chat_id,
             telegram_message_id,
         )
-    )
+        return int(value)
+    except asyncpg.UniqueViolationError as exc:
+        raise DuplicateCallError(token_address) from exc
 
 
 async def get_active_calls(pool: asyncpg.Pool) -> list[asyncpg.Record]:
@@ -514,6 +547,107 @@ async def get_calls_for_period(
         ORDER BY call_time DESC;
     """
     return list(await pool.fetch(query))
+
+
+async def get_existing_call(
+    pool: asyncpg.Pool,
+    token_address: str,
+) -> asyncpg.Record | None:
+    return await pool.fetchrow(
+        """
+        SELECT id, token_name, symbol, entry_valuation, highest_valuation,
+               highest_profit_percent, call_time, telegram_message_id
+        FROM calls
+        WHERE lower(token_address) = lower($1)
+        ORDER BY call_time ASC
+        LIMIT 1;
+        """,
+        token_address,
+    )
+
+
+async def token_was_called(pool: asyncpg.Pool, token_address: str) -> bool:
+    return bool(
+        await pool.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM calls WHERE lower(token_address)=lower($1));",
+            token_address,
+        )
+    )
+
+
+async def get_daily_leaders(
+    pool: asyncpg.Pool,
+    limit: int = 3,
+) -> list[asyncpg.Record]:
+    return list(
+        await pool.fetch(
+            """
+            SELECT symbol, token_name, valuation_type, entry_valuation,
+                   highest_valuation, highest_profit_percent
+            FROM calls
+            WHERE call_time >= now() - interval '24 hours'
+            ORDER BY highest_profit_percent DESC, call_time DESC
+            LIMIT $1;
+            """,
+            limit,
+        )
+    )
+
+
+async def get_stats_page(
+    pool: asyncpg.Pool,
+    period: str,
+    page_number: int,
+) -> asyncpg.Record | None:
+    return await pool.fetchrow(
+        "SELECT * FROM stats_pages WHERE period=$1 AND page_number=$2;",
+        period, page_number,
+    )
+
+
+async def list_stats_pages(
+    pool: asyncpg.Pool,
+    period: str,
+) -> list[asyncpg.Record]:
+    return list(
+        await pool.fetch(
+            "SELECT * FROM stats_pages WHERE period=$1 ORDER BY page_number;",
+            period,
+        )
+    )
+
+
+async def upsert_stats_page(
+    pool: asyncpg.Pool,
+    *,
+    period: str,
+    page_number: int,
+    channel_chat_id: int,
+    message_id: int,
+) -> None:
+    await pool.execute(
+        """
+        INSERT INTO stats_pages(period,page_number,channel_chat_id,message_id)
+        VALUES($1,$2,$3,$4)
+        ON CONFLICT(period,page_number) DO UPDATE
+        SET channel_chat_id=EXCLUDED.channel_chat_id,
+            message_id=EXCLUDED.message_id,
+            updated_at=now();
+        """,
+        period, page_number, channel_chat_id, message_id,
+    )
+
+
+async def delete_stats_page_record(
+    pool: asyncpg.Pool,
+    *,
+    period: str,
+    page_number: int,
+) -> None:
+    await pool.execute(
+        "DELETE FROM stats_pages WHERE period=$1 AND page_number=$2;",
+        period, page_number,
+    )
 
 
 async def close_pool(pool: asyncpg.Pool) -> None:
