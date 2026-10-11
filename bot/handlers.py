@@ -32,8 +32,6 @@ logger = logging.getLogger(__name__)
 DB_KEY = "db"
 REDIS_KEY = "redis"
 
-_LOCAL_MESSAGE_COUNTS: dict[int, int] = {}
-
 BOT_COMMANDS = (
     ("start", "Start the bot"),
     ("help", "Show help"),
@@ -135,12 +133,9 @@ def _dex_request(token_address: str) -> list[dict]:
         },
     )
     with urllib.request.urlopen(req, timeout=12) as response:
-        payload = response.read().decode("utf-8")
-        data = json.loads(payload)
+        data = json.loads(response.read().decode("utf-8"))
 
-    if isinstance(data, list):
-        return data
-    return []
+    return data if isinstance(data, list) else []
 
 
 async def _fetch_best_pair(token_address: str) -> dict | None:
@@ -182,36 +177,32 @@ async def _fetch_best_pair(token_address: str) -> dict | None:
 def _call_data_from_pair(token_address: str, pair: dict) -> dict:
     base = pair.get("baseToken") or {}
 
-    market_cap = pair.get("marketCap")
-    fdv = pair.get("fdv")
-    liquidity = (pair.get("liquidity") or {}).get("usd")
-    price_usd = pair.get("priceUsd")
+    def as_float(value):
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    market_cap = as_float(pair.get("marketCap"))
+    fdv = as_float(pair.get("fdv"))
+    liquidity = as_float((pair.get("liquidity") or {}).get("usd"))
+    price_usd = as_float(pair.get("priceUsd"))
     created_at = pair.get("pairCreatedAt")
     pair_address = pair.get("pairAddress")
-
-    try:
-        market_cap = float(market_cap) if market_cap is not None else None
-    except (TypeError, ValueError):
-        market_cap = None
-
-    try:
-        fdv = float(fdv) if fdv is not None else None
-    except (TypeError, ValueError):
-        fdv = None
-
-    try:
-        liquidity = float(liquidity) if liquidity is not None else None
-    except (TypeError, ValueError):
-        liquidity = None
-
-    try:
-        price_usd = float(price_usd) if price_usd is not None else None
-    except (TypeError, ValueError):
-        price_usd = None
 
     dex_url = pair.get("url")
     if not dex_url and pair_address:
         dex_url = f"https://dexscreener.com/solana/{pair_address}"
+
+    if market_cap is not None and market_cap > 0:
+        valuation_type = "marketCap"
+        entry_valuation = market_cap
+    elif fdv is not None and fdv > 0:
+        valuation_type = "fdv"
+        entry_valuation = fdv
+    else:
+        valuation_type = None
+        entry_valuation = None
 
     return {
         "token_address": token_address,
@@ -224,14 +215,16 @@ def _call_data_from_pair(token_address: str, pair: dict) -> dict:
         "pair_created_at": created_at,
         "pair_address": pair_address,
         "dex_url": dex_url,
+        "valuation_type": valuation_type,
+        "entry_valuation": entry_valuation,
     }
 
 
 def _preview_text(call: dict) -> str:
-    if call["market_cap"] is not None:
-        valuation_line = f"💰 שווי שוק: {_fmt_usd(call['market_cap'])}"
-    elif call["fdv"] is not None:
-        valuation_line = f"💰 FDV: {_fmt_usd(call['fdv'])} (Market Cap לא זמין)"
+    if call["valuation_type"] == "marketCap":
+        valuation_line = f"💰 שווי שוק: {_fmt_usd(call['entry_valuation'])}"
+    elif call["valuation_type"] == "fdv":
+        valuation_line = f"💰 FDV: {_fmt_usd(call['entry_valuation'])} (Market Cap לא זמין)"
     else:
         valuation_line = "💰 שווי שוק: לא זמין"
 
@@ -248,22 +241,16 @@ def _preview_text(call: dict) -> str:
 
 
 def _channel_call_text(call: dict) -> str:
-    if call["market_cap"] is not None:
-        valuation_line = f"💰 שווי שוק בזמן ההמלצה: {_fmt_usd(call['market_cap'])}"
-    elif call["fdv"] is not None:
-        valuation_line = f"💰 FDV בזמן ההמלצה: {_fmt_usd(call['fdv'])}"
-    else:
-        valuation_line = "💰 שווי שוק בזמן ההמלצה: לא זמין"
-
+    metric = "שווי שוק" if call["valuation_type"] == "marketCap" else "FDV"
     return (
         "🚨 המלצה חדשה\n\n"
         f"🪙 {call['name']} (${call['symbol']})\n"
-        f"{valuation_line}\n"
+        f"💰 {metric} בזמן ההמלצה: {_fmt_usd(call['entry_valuation'])}\n"
         f"💵 מחיר בזמן ההמלצה: {_fmt_usd(call['price_usd'])}\n"
         f"💧 נזילות: {_fmt_usd(call['liquidity'])}\n"
         f"⏱ גיל המטבע: {_age_text(call['pair_created_at'])}\n\n"
         f"📍 CA:\n{call['token_address']}\n\n"
-        "⚠️ Memecoins הם נכסים בסיכון גבוה. אין באמור ייעוץ פיננסי."
+        "⚠️ אזהרה: מסחר בקריפטו וב־Memecoins הוא תנודתי ומסוכן ועלול להביא לאובדן מלא של ההשקעה. אין בפרסום משום ייעוץ או המלצה אישית. כל החלטת מסחר היא באחריות המשתמש בלבד."
     )
 
 
@@ -290,16 +277,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
-    message = update.effective_message
-    if message is not None:
-        await message.reply_text(HELP_TEXT)
+    if update.effective_message is not None:
+        await update.effective_message.reply_text(HELP_TEXT)
 
 
 async def about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
-    message = update.effective_message
-    if message is not None:
-        await message.reply_text("בוט המלצות Memecoins בזמן אמת.")
+    if update.effective_message is not None:
+        await update.effective_message.reply_text("בוט המלצות Memecoins בזמן אמת.")
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -382,10 +367,7 @@ async def echo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if not SOLANA_CA_RE.fullmatch(text):
-        await message.reply_text(
-            "שלח כתובת CA תקינה של Solana.\n\n"
-            "לדוגמה: כתובת Base58 באורך 32–44 תווים."
-        )
+        await message.reply_text("שלח כתובת CA תקינה של Solana.")
         return
 
     status = await message.reply_text("🔍 בודק את המטבע ב-DexScreener...")
@@ -405,6 +387,13 @@ async def echo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     call = _call_data_from_pair(text, pair)
+
+    if not call["pair_address"] or call["entry_valuation"] is None:
+        await status.edit_text(
+            "❌ לא ניתן לעקוב אחרי המטבע כי DexScreener לא החזיר Pair ושווי שוק/FDV תקינים."
+        )
+        return
+
     context.user_data["pending_call"] = call
 
     buttons = [[
@@ -443,20 +432,29 @@ async def publish_call_callback(
         )
         return
 
+    pool = context.bot_data.get(DB_KEY)
+    if pool is None:
+        await query.edit_message_text(
+            "❌ מסד הנתונים אינו זמין כרגע, ולכן ההמלצה לא תפורסם ללא מעקב."
+        )
+        return
+
     target = _channel_target()
     if target is None:
         await query.edit_message_text("❌ CHANNEL_ID לא מוגדר ב-Railway.")
         return
 
-    keyboard = []
+    keyboard = None
     if call.get("dex_url"):
-        keyboard.append([InlineKeyboardButton("📈 DexScreener", url=call["dex_url"])])
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📈 DexScreener", url=call["dex_url"])]]
+        )
 
     try:
         sent = await context.bot.send_message(
             chat_id=target,
             text=_channel_call_text(call),
-            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+            reply_markup=keyboard,
             disable_web_page_preview=True,
         )
     except Exception as exc:
@@ -467,12 +465,43 @@ async def publish_call_callback(
         )
         return
 
+    try:
+        call_id = await db.insert_call(
+            pool,
+            token_address=call["token_address"],
+            token_name=call["name"],
+            symbol=call["symbol"],
+            pair_address=call["pair_address"],
+            dexscreener_url=call.get("dex_url"),
+            valuation_type=call["valuation_type"],
+            entry_price=call["price_usd"],
+            entry_valuation=call["entry_valuation"],
+            channel_chat_id=sent.chat.id,
+            telegram_message_id=sent.message_id,
+        )
+    except Exception as exc:
+        logger.exception("Saving call failed")
+        try:
+            await context.bot.delete_message(
+                chat_id=sent.chat.id,
+                message_id=sent.message_id,
+            )
+        except Exception:
+            logger.exception("Could not delete untracked channel message")
+
+        await query.edit_message_text(
+            "❌ ההמלצה לא נשמרה למסד הנתונים ולכן ביטלתי את הפרסום.\n\n"
+            f"שגיאה: {exc}"
+        )
+        return
+
     context.user_data.pop("pending_call", None)
 
     await query.edit_message_text(
-        "✅ ההמלצה פורסמה בערוץ.\n\n"
+        "✅ ההמלצה פורסמה ונכנסה למעקב אוטומטי.\n\n"
         f"{call['name']} (${call['symbol']})\n"
-        f"Telegram message ID: {sent.message_id}"
+        f"Call ID: {call_id}\n"
+        "הבוט יבדוק אותה אוטומטית ויפרסם יעדי 100%, 200%, 300% וכו׳."
     )
 
 
@@ -490,9 +519,8 @@ async def cancel_call_callback(
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
-    message = update.effective_message
-    if message is not None:
-        await message.reply_text("פקודה לא מוכרת. שלח /help לעזרה.")
+    if update.effective_message is not None:
+        await update.effective_message.reply_text("פקודה לא מוכרת. שלח /help לעזרה.")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
