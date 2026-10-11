@@ -377,47 +377,15 @@ def _daily_leaders_text(leaders) -> str:
     )
 
 
-def _weekly_leaders_text(leaders) -> str:
-    return _leaders_text(
-        leaders,
-        title="המרוויחים הגבוהים של השבוע",
-        empty_text="עדיין אין מספיק המלצות ב־7 הימים האחרונים.",
-    )
-
-
-def _channel_stats_text(summary) -> str:
-    if not summary:
-        total = 0
-        cumulative = 0.0
-        average = 0.0
-    else:
-        total = int(summary["total_calls"] or 0)
-        cumulative = float(summary["cumulative_ath_pnl_percent"] or 0.0)
-        average = float(summary["average_ath_profit_percent"] or 0.0)
-
-    return (
-        "📊 <b>סטטיסטיקת הערוץ — כל הזמנים</b>\n"
-        f"🧾 <b>סה״כ המלצות:</b> {total:,}\n"
-        f"💹 <b>PNL מצטבר לפי ATH:</b> {cumulative:+,.1f}%\n"
-        f"📈 <b>רווח ATH ממוצע להמלצה:</b> {average:+,.1f}%\n\n"
-        "🔄 <i>הנתונים משתנים בזמן אמת ומתעדכנים לפי נתוני שוק אמיתיים.</i>\n"
-        "ℹ️ <i>PNL מצטבר הוא סכום אחוזי ה־ATH של כל ההמלצות, ולא תשואת תיק בפועל.</i>"
-    )
-
-
 def _channel_call_text(
     call: dict,
     daily_leaders=None,
-    weekly_leaders=None,
-    summary=None,
 ) -> str:
     metric = "MC" if call["valuation_type"] == "marketCap" else "FDV"
     name = html.escape(str(call["name"]))
     symbol = html.escape(str(call["symbol"]))
     token_address = html.escape(str(call["token_address"]))
     daily_block = _daily_leaders_text(daily_leaders or [])
-    weekly_block = _weekly_leaders_text(weekly_leaders or [])
-    stats_block = _channel_stats_text(summary)
 
     return (
         "🚨🚨 <b>CALL חדש</b> 🚨🚨\n"
@@ -431,10 +399,6 @@ def _channel_call_text(
         f"<code>{token_address}</code>\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"{daily_block}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"{weekly_block}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"{stats_block}\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         "⚠️ <i>אזהרה: מסחר בקריפטו וב־Memecoins הוא תנודתי ומסוכן ועלול להביא "
         "לאובדן מלא של ההשקעה. אין בפרסום משום ייעוץ או המלצה אישית. "
@@ -744,18 +708,6 @@ async def publish_call_callback(
         logger.exception("Could not load daily leaders for the new call")
         daily_leaders = []
 
-    try:
-        weekly_leaders = await db.get_weekly_leaders(pool, limit=3)
-    except Exception:
-        logger.exception("Could not load weekly leaders for the new call")
-        weekly_leaders = []
-
-    try:
-        performance_summary = await db.get_all_time_performance_summary(pool)
-    except Exception:
-        logger.exception("Could not load all-time performance summary for the new call")
-        performance_summary = None
-
     # Repair/create the channel-native list posts.  A failure here no longer
     # prevents the recommendation text itself from being finalized.
     try:
@@ -782,7 +734,7 @@ async def publish_call_callback(
         await context.bot.edit_message_text(
             chat_id=sent.chat.id,
             message_id=sent.message_id,
-            text=_channel_call_text(call, daily_leaders, weekly_leaders, performance_summary),
+            text=_channel_call_text(call, daily_leaders),
             parse_mode="HTML",
             reply_markup=final_keyboard,
             disable_web_page_preview=True,

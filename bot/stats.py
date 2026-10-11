@@ -94,10 +94,43 @@ def _call_line(index: int, row) -> str:
     )
 
 
-def _page_text(period: str, rows: list, page: int, pages: int, total: int) -> str:
+def _all_time_summary_text(summary) -> str:
+    if not summary:
+        total = 0
+        cumulative = 0.0
+        average = 0.0
+    else:
+        total = int(summary["total_calls"] or 0)
+        cumulative = float(summary["cumulative_ath_pnl_percent"] or 0.0)
+        average = float(summary["average_ath_profit_percent"] or 0.0)
+
+    return (
+        "📊 <b>סטטיסטיקת כל ההמלצות</b>\n"
+        f"🧾 <b>סה״כ המלצות:</b> {total:,}\n"
+        f"💹 <b>PNL מצטבר לפי ATH:</b> {cumulative:+,.1f}%\n"
+        f"📈 <b>רווח ATH ממוצע להמלצה:</b> {average:+,.1f}%\n"
+        f"➗ <i>ממוצע = PNL מצטבר ÷ {total:,} המלצות</i>\n\n"
+        "🔄 <i>הנתונים משתנים בזמן אמת ומתעדכנים לפי נתוני שוק אמיתיים.</i>\n"
+        "ℹ️ <i>PNL מצטבר הוא סכום אחוזי ה־ATH של כל ההמלצות, ולא תשואת תיק בפועל.</i>"
+    )
+
+
+def _page_text(
+    period: str,
+    rows: list,
+    page: int,
+    pages: int,
+    total: int,
+    summary=None,
+) -> str:
     title = _period_title(period)
+    summary_block = _all_time_summary_text(summary) if period == "all" and page == 1 else None
+
     if not rows:
-        return f"<b>{title}</b>\n\nאין עדיין המלצות בתקופה הזאת."
+        base = f"<b>{title}</b>\n\nאין עדיין המלצות בתקופה הזאת."
+        if summary_block:
+            base += f"\n\n━━━━━━━━━━━━━━━━━━\n\n{summary_block}"
+        return base
 
     start_index = (page - 1) * CALLS_PER_PAGE + 1
     body = "\n\n━━━━━━━━━━━━━━━━━━\n\n".join(
@@ -105,11 +138,15 @@ def _page_text(period: str, rows: list, page: int, pages: int, total: int) -> st
     )
     header = (
         f"<b>{title}</b>\n"
-        f"📊 סה״כ המלצות: <b>{total}</b>\n"
+        f"📊 סה״כ המלצות בתקופה: <b>{total}</b>\n"
         "⬇️ <i>ממויין לפי אחוז הרווח מה־ATH הגבוה לנמוך</i>"
     )
     if pages > 1:
         header += f"\n📄 עמוד {page}/{pages}"
+
+    if summary_block:
+        header += f"\n\n━━━━━━━━━━━━━━━━━━\n\n{summary_block}"
+
     return f"{header}\n\n{body}\n\n🔄 <i>הרשימה מתעדכנת אוטומטית.</i>"
 
 
@@ -237,6 +274,11 @@ async def refresh_stats_period(
     channel_chat_id: int,
 ) -> None:
     calls = await db.get_calls_for_period(pool, period)
+    performance_summary = (
+        await db.get_all_time_performance_summary(pool)
+        if period == "all"
+        else None
+    )
     chunks = [
         calls[i:i + CALLS_PER_PAGE]
         for i in range(0, len(calls), CALLS_PER_PAGE)
@@ -287,6 +329,7 @@ async def refresh_stats_period(
                 page_number,
                 len(chunks),
                 len(calls),
+                summary=performance_summary,
             )
 
             try:
