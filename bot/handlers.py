@@ -66,6 +66,95 @@ HELP_TEXT = """הבוט פעיל.
 SOLANA_CA_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
 
+LIST_ITEMS_PER_MESSAGE = 20
+
+
+def _bot_deep_link(username: str, payload: str) -> str:
+    return f"https://t.me/{username}?start={payload}"
+
+
+def _lists_keyboard(bot_username: str, dex_url: str | None = None) -> InlineKeyboardMarkup:
+    rows = []
+    if dex_url:
+        rows.append([InlineKeyboardButton("📈 DexScreener", url=dex_url)])
+
+    rows.append([
+        InlineKeyboardButton(
+            "📋 יומי",
+            url=_bot_deep_link(bot_username, "calls_day"),
+        ),
+        InlineKeyboardButton(
+            "📅 שבועי",
+            url=_bot_deep_link(bot_username, "calls_week"),
+        ),
+    ])
+    rows.append([
+        InlineKeyboardButton(
+            "🏆 כל הזמנים",
+            url=_bot_deep_link(bot_username, "calls_all"),
+        )
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _period_title(period: str) -> str:
+    return {
+        "day": "📋 המלצות יומיות — 24 השעות האחרונות",
+        "week": "📅 המלצות שבועיות — 7 הימים האחרונים",
+        "all": "🏆 כל ההמלצות — כל הזמנים",
+    }[period]
+
+
+def _call_list_item(row) -> str:
+    entry = float(row["entry_valuation"])
+    ath = float(row["highest_valuation"] or entry)
+    multiple = ath / entry if entry > 0 else 0.0
+    profit = ((ath / entry) - 1.0) * 100.0 if entry > 0 else 0.0
+    metric = "MC" if row["valuation_type"] == "marketCap" else "FDV"
+
+    return (
+        f"🪙 {row['symbol']}\n"
+        f"💰 {metric} בפרסום: {_fmt_usd(entry)}\n"
+        f"🏆 ATH מאז הפרסום: {_fmt_usd(ath)} "
+        f"• {multiple:.2f}X • {profit:+.0f}%"
+    )
+
+
+async def _send_calls_list(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    period: str,
+) -> None:
+    pool = context.bot_data.get(DB_KEY)
+    if pool is None:
+        await message.reply_text("❌ מסד הנתונים אינו זמין כרגע.")
+        return
+
+    rows = await db.get_calls_for_period(pool, period)
+    if not rows:
+        await message.reply_text(
+            f"{_period_title(period)}\n\nאין עדיין המלצות בתקופה הזאת."
+        )
+        return
+
+    total = len(rows)
+    chunks = [
+        rows[i:i + LIST_ITEMS_PER_MESSAGE]
+        for i in range(0, total, LIST_ITEMS_PER_MESSAGE)
+    ]
+
+    for index, chunk in enumerate(chunks, start=1):
+        body = "\n\n".join(_call_list_item(row) for row in chunk)
+        header = f"{_period_title(period)}\nסה״כ המלצות: {total}"
+        if len(chunks) > 1:
+            header += f"\nעמוד {index}/{len(chunks)}"
+
+        await message.reply_text(
+            f"{header}\n\n{body}",
+            disable_web_page_preview=True,
+        )
+
+
 def _channel_target() -> str | int | None:
     value = os.getenv("CHANNEL_ID", "").strip()
     if not value:
@@ -265,6 +354,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if pool is not None:
         is_new = await db.upsert_user(pool, user.id, user.username, user.first_name)
 
+    payload = context.args[0] if context.args else None
+    payload_to_period = {
+        "calls_day": "day",
+        "calls_week": "week",
+        "calls_all": "all",
+    }
+
+    if payload in payload_to_period:
+        await _send_calls_list(message, context, payload_to_period[payload])
+        return
+
     name = user.first_name if user.first_name else "friend"
     greeting = "ברוך הבא" if is_new else "ברוך שובך"
 
@@ -444,11 +544,15 @@ async def publish_call_callback(
         await query.edit_message_text("❌ CHANNEL_ID לא מוגדר ב-Railway.")
         return
 
-    keyboard = None
-    if call.get("dex_url"):
-        keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("📈 DexScreener", url=call["dex_url"])]]
-        )
+    bot_username = context.bot.username
+    if not bot_username:
+        me = await context.bot.get_me()
+        bot_username = me.username
+
+    keyboard = _lists_keyboard(
+        bot_username=bot_username,
+        dex_url=call.get("dex_url"),
+    )
 
     try:
         sent = await context.bot.send_message(
