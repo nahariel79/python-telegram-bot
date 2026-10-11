@@ -1,0 +1,21 @@
+Required variables already used by the project:
+- BOT_TOKEN
+- CHANNEL_ID
+- DATABASE_URL
+- REDIS_URL
+
+Recommended:
+- ADMIN_USER_ID=<your Telegram numeric user id>
+- TRACK_INTERVAL_SECONDS=30
+- PAIR_REFRESH_SECONDS=300
+- HISTORY_LOOP_SECONDS=90
+- HISTORY_RECHECK_SECONDS=600
+- HISTORY_MAX_HOURLY_PAGES=4
+
+Optional for stronger production historical coverage across pool migrations:
+- COINGECKO_PRO_API_KEY=<your CoinGecko Pro API key>
+
+Without COINGECKO_PRO_API_KEY the bot falls back to the keyless GeckoTerminal
+pool OHLCV API. It checks both the original call pool and the latest best pool.
+The keyless API has a low shared rate limit, so the history loop is intentionally
+throttled to one call reconciliation every 90 seconds by default.

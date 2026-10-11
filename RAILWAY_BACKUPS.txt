@@ -1,0 +1,14 @@
+Railway database backup setup (manual dashboard setting, not a code file):
+
+1. Open the PostgreSQL service in Railway.
+2. Open the Backups tab.
+3. Enable Daily backups.
+4. Enable Weekly backups as a second layer.
+5. For stronger protection, enable Point-in-Time Recovery (PITR) if available.
+
+Normal bot code deploys do NOT delete PostgreSQL data. The db.py in this package
+uses additive, versioned migrations and does not DROP the calls or milestones tables.
+
+For an important production channel, also keep a portable pg_dump backup outside
+the project from time to time. Railway's volume backups protect the project volume,
+while an external logical dump protects against accidental project/volume deletion.
