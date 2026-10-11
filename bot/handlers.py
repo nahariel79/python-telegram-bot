@@ -1,65 +1,270 @@
 """Telegram update handlers for the memecoin calls bot."""
 
+import asyncio
+import json
 import logging
 import os
+import re
+import urllib.request
+from datetime import datetime, timezone
 
-from telegram import ReplyKeyboardMarkup, Update
-from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, TimedOut
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.error import Conflict, NetworkError, TimedOut
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from bot import cache, db
 
 
 logger = logging.getLogger(__name__)
 
-# Keys used to read shared connections from Application.bot_data.
 DB_KEY = "db"
 REDIS_KEY = "redis"
 
-# In-memory fallback for the per-user message counter when Redis is unavailable.
 _LOCAL_MESSAGE_COUNTS: dict[int, int] = {}
 
 BOT_COMMANDS = (
-    ("start", "פתיחת הבוט"),
-    ("help", "עזרה"),
-    ("about", "מידע על הבוט"),
-    ("ping", "בדיקת מצב הבוט"),
-    ("channeltest", "בדיקת פרסום לערוץ"),
+    ("start", "Start the bot"),
+    ("help", "Show help"),
+    ("about", "Show bot information"),
+    ("ping", "Check bot status"),
+    ("myid", "Show your Telegram user ID"),
+    ("channeltest", "Test publishing to the channel"),
 )
 
-MENU_HELP = "עזרה"
-MENU_ABOUT = "אודות"
-MENU_PING = "בדיקת בוט"
+MENU_HELP = "Help"
+MENU_ABOUT = "About"
+MENU_PING = "Ping"
 
 MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [[MENU_HELP, MENU_ABOUT], [MENU_PING]],
     resize_keyboard=True,
     is_persistent=True,
-    input_field_placeholder="בחר פעולה",
+    input_field_placeholder="Choose a menu item",
 )
 
-HELP_TEXT = """פקודות זמינות:
-/start - פתיחת הבוט
-/help - עזרה
-/about - מידע על הבוט
-/ping - בדיקת מצב הבוט
-/channeltest - בדיקת פרסום לערוץ
+HELP_TEXT = """הבוט פעיל.
 
-לבדיקת פרסום לערוץ אפשר גם לשלוח בפרטי את המילה: test
+שלח לי כתובת CA של מטבע Solana, ואני אציג תצוגה מקדימה של ההמלצה.
+
+פקודות:
+/start - הפעלת הבוט
+/channeltest - בדיקת פרסום לערוץ
+/myid - הצגת Telegram User ID
+/ping - בדיקת סטטוס
 """
 
+SOLANA_CA_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
-def _channel_id_from_env() -> int | str | None:
-    """Return CHANNEL_ID as int for numeric IDs or str for @usernames."""
-    raw_value = os.getenv("CHANNEL_ID", "").strip()
-    if not raw_value:
+
+def _channel_target() -> str | int | None:
+    value = os.getenv("CHANNEL_ID", "").strip()
+    if not value:
+        return None
+    if value.startswith("@"):
+        return value
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
+def _admin_allowed(user_id: int) -> bool:
+    configured = os.getenv("ADMIN_USER_ID", "").strip()
+    if not configured:
+        return True
+    try:
+        return user_id == int(configured)
+    except ValueError:
+        logger.warning("ADMIN_USER_ID is not a valid integer.")
+        return True
+
+
+def _fmt_usd(value: float | int | None) -> str:
+    if value is None:
+        return "לא זמין"
+    value = float(value)
+    if value >= 1_000_000_000:
+        return f"${value / 1_000_000_000:.2f}B"
+    if value >= 1_000_000:
+        return f"${value / 1_000_000:.2f}M"
+    if value >= 1_000:
+        return f"${value / 1_000:.1f}K"
+    if value >= 1:
+        return f"${value:,.2f}"
+    return f"${value:.10f}".rstrip("0").rstrip(".")
+
+
+def _age_text(pair_created_at_ms: int | None) -> str:
+    if not pair_created_at_ms:
+        return "לא זמין"
+
+    created = datetime.fromtimestamp(pair_created_at_ms / 1000, tz=timezone.utc)
+    now = datetime.now(timezone.utc)
+    seconds = max(0, int((now - created).total_seconds()))
+
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+
+    if days:
+        return f"{days} ימים ו-{hours} שעות"
+    if hours:
+        return f"{hours} שעות ו-{minutes} דקות"
+    return f"{minutes} דקות"
+
+
+def _dex_request(token_address: str) -> list[dict]:
+    url = f"https://api.dexscreener.com/token-pairs/v1/solana/{token_address}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Telegram-Memecoin-Calls-Bot/1.0",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=12) as response:
+        payload = response.read().decode("utf-8")
+        data = json.loads(payload)
+
+    if isinstance(data, list):
+        return data
+    return []
+
+
+async def _fetch_best_pair(token_address: str) -> dict | None:
+    pairs = await asyncio.to_thread(_dex_request, token_address)
+    if not pairs:
         return None
 
+    token_lower = token_address.lower()
+
+    preferred = [
+        p
+        for p in pairs
+        if str(p.get("chainId", "")).lower() == "solana"
+        and str((p.get("baseToken") or {}).get("address", "")).lower() == token_lower
+    ]
+
+    candidates = preferred or [
+        p for p in pairs if str(p.get("chainId", "")).lower() == "solana"
+    ]
+    if not candidates:
+        return None
+
+    def score(pair: dict) -> tuple[float, float]:
+        liquidity = ((pair.get("liquidity") or {}).get("usd")) or 0
+        volume_24h = ((pair.get("volume") or {}).get("h24")) or 0
+        try:
+            liquidity = float(liquidity)
+        except (TypeError, ValueError):
+            liquidity = 0.0
+        try:
+            volume_24h = float(volume_24h)
+        except (TypeError, ValueError):
+            volume_24h = 0.0
+        return liquidity, volume_24h
+
+    return max(candidates, key=score)
+
+
+def _call_data_from_pair(token_address: str, pair: dict) -> dict:
+    base = pair.get("baseToken") or {}
+
+    market_cap = pair.get("marketCap")
+    fdv = pair.get("fdv")
+    liquidity = (pair.get("liquidity") or {}).get("usd")
+    price_usd = pair.get("priceUsd")
+    created_at = pair.get("pairCreatedAt")
+    pair_address = pair.get("pairAddress")
+
     try:
-        return int(raw_value)
-    except ValueError:
-        # Allows using a public channel username such as @my_channel.
-        return raw_value
+        market_cap = float(market_cap) if market_cap is not None else None
+    except (TypeError, ValueError):
+        market_cap = None
+
+    try:
+        fdv = float(fdv) if fdv is not None else None
+    except (TypeError, ValueError):
+        fdv = None
+
+    try:
+        liquidity = float(liquidity) if liquidity is not None else None
+    except (TypeError, ValueError):
+        liquidity = None
+
+    try:
+        price_usd = float(price_usd) if price_usd is not None else None
+    except (TypeError, ValueError):
+        price_usd = None
+
+    dex_url = pair.get("url")
+    if not dex_url and pair_address:
+        dex_url = f"https://dexscreener.com/solana/{pair_address}"
+
+    return {
+        "token_address": token_address,
+        "name": base.get("name") or "Unknown",
+        "symbol": base.get("symbol") or "UNKNOWN",
+        "price_usd": price_usd,
+        "market_cap": market_cap,
+        "fdv": fdv,
+        "liquidity": liquidity,
+        "pair_created_at": created_at,
+        "pair_address": pair_address,
+        "dex_url": dex_url,
+    }
+
+
+def _preview_text(call: dict) -> str:
+    if call["market_cap"] is not None:
+        valuation_line = f"💰 שווי שוק: {_fmt_usd(call['market_cap'])}"
+    elif call["fdv"] is not None:
+        valuation_line = f"💰 FDV: {_fmt_usd(call['fdv'])} (Market Cap לא זמין)"
+    else:
+        valuation_line = "💰 שווי שוק: לא זמין"
+
+    return (
+        "🔎 תצוגה מקדימה להמלצה\n\n"
+        f"🪙 {call['name']} (${call['symbol']})\n"
+        f"{valuation_line}\n"
+        f"💵 מחיר: {_fmt_usd(call['price_usd'])}\n"
+        f"💧 נזילות: {_fmt_usd(call['liquidity'])}\n"
+        f"⏱ גיל ה-Pair: {_age_text(call['pair_created_at'])}\n\n"
+        f"📍 CA:\n{call['token_address']}\n\n"
+        "אם הנתונים נכונים, לחץ על „פרסם המלצה”."
+    )
+
+
+def _channel_call_text(call: dict) -> str:
+    if call["market_cap"] is not None:
+        valuation_line = f"💰 שווי שוק בזמן ההמלצה: {_fmt_usd(call['market_cap'])}"
+    elif call["fdv"] is not None:
+        valuation_line = f"💰 FDV בזמן ההמלצה: {_fmt_usd(call['fdv'])}"
+    else:
+        valuation_line = "💰 שווי שוק בזמן ההמלצה: לא זמין"
+
+    return (
+        "🚨 המלצה חדשה\n\n"
+        f"🪙 {call['name']} (${call['symbol']})\n"
+        f"{valuation_line}\n"
+        f"💵 מחיר בזמן ההמלצה: {_fmt_usd(call['price_usd'])}\n"
+        f"💧 נזילות: {_fmt_usd(call['liquidity'])}\n"
+        f"⏱ גיל המטבע: {_age_text(call['pair_created_at'])}\n\n"
+        f"📍 CA:\n{call['token_address']}\n\n"
+        "⚠️ Memecoins הם נכסים בסיכון גבוה. אין באמור ייעוץ פיננסי."
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -68,17 +273,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if message is None or user is None:
         return
 
-    # Persist the user in PostgreSQL when available.
     pool = context.bot_data.get(DB_KEY)
     is_new = True
     if pool is not None:
         is_new = await db.upsert_user(pool, user.id, user.username, user.first_name)
 
-    name = user.first_name if user.first_name else ""
+    name = user.first_name if user.first_name else "friend"
     greeting = "ברוך הבא" if is_new else "ברוך שובך"
+
     await message.reply_text(
-        f"{greeting} {name}! הבוט פעיל.\n\n"
-        "לבדיקת פרסום לערוץ שלח: test",
+        f"{greeting}, {name}!\n\n"
+        "שלח לי CA של מטבע Solana כדי להכין תצוגה מקדימה להמלצה.",
         reply_markup=MAIN_MENU_KEYBOARD,
     )
 
@@ -86,22 +291,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
     message = update.effective_message
-    if message is None:
-        return
-
-    await message.reply_text(HELP_TEXT)
+    if message is not None:
+        await message.reply_text(HELP_TEXT)
 
 
 async def about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
     message = update.effective_message
-    if message is None:
-        return
-
-    await message.reply_text(
-        "בוט לניהול המלצות Memecoins בזמן אמת.\n"
-        "בשלב זה אנחנו בודקים את החיבור בין הבוט לערוץ."
-    )
+    if message is not None:
+        await message.reply_text("בוט המלצות Memecoins בזמן אמת.")
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -111,71 +309,46 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     client = context.bot_data.get(REDIS_KEY)
     if client is None:
-        await message.reply_text("✅ הבוט פעיל")
+        await message.reply_text("pong")
         return
 
     cached = await cache.get_or_set_ping(client)
-    source = "cache" if cached else "fresh"
-    await message.reply_text(f"✅ הבוט פעיל ({source})")
+    source = "cached" if cached else "fresh"
+    await message.reply_text(f"pong ({source})")
 
 
-async def publish_channel_test(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Publish a test message to the configured Telegram channel."""
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
+    message = update.effective_message
+    user = update.effective_user
+    if message is not None and user is not None:
+        await message.reply_text(f"Telegram User ID שלך:\n{user.id}")
+
+
+async def channel_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if message is None:
         return
 
-    channel_id = _channel_id_from_env()
-    if channel_id is None:
-        await message.reply_text(
-            "❌ CHANNEL_ID לא מוגדר ב-Railway.\n"
-            "הוסף משתנה בשם CHANNEL_ID והכנס בו את מזהה הערוץ."
-        )
+    target = _channel_target()
+    if target is None:
+        await message.reply_text("❌ CHANNEL_ID לא מוגדר ב-Railway.")
         return
 
     try:
-        # get_chat validates that the bot can resolve the configured channel.
-        chat = await context.bot.get_chat(chat_id=channel_id)
-
-        await context.bot.send_message(
-            chat_id=channel_id,
-            text="בדיקת מערכת ✅\n\nהבוט מחובר לערוץ ומסוגל לפרסם הודעות.",
+        sent = await context.bot.send_message(
+            chat_id=target,
+            text="בדיקת מערכת ✅\nהבוט מחובר לערוץ ומסוגל לפרסם הודעות.",
         )
-
-        chat_name = getattr(chat, "title", None) or getattr(chat, "username", None) or "הערוץ"
         await message.reply_text(
-            "✅ ההודעה פורסמה בערוץ בהצלחה.\n\n"
-            f"ערוץ: {chat_name}\n"
-            f"Chat ID: {chat.id}"
+            f"✅ ההודעה פורסמה בערוץ.\nChat ID בפועל: {sent.chat.id}"
         )
-
-    except Forbidden as exc:
-        logger.warning("Telegram channel permission error: %s", exc)
+    except Exception as exc:
+        logger.exception("Channel test failed")
         await message.reply_text(
-            "❌ הבוט מצא את הערוץ אבל אין לו הרשאה לפרסם בו.\n\n"
-            "בדוק שהבוט מוגדר כמנהל בערוץ ושיש לו הרשאת Post Messages."
+            "❌ לא הצלחתי לפרסם בערוץ.\n\n"
+            f"השגיאה שהתקבלה: {exc}"
         )
-    except BadRequest as exc:
-        logger.warning("Telegram channel bad request: %s", exc)
-        await message.reply_text(
-            "❌ Telegram לא הצליח למצוא או לפתוח את הערוץ לפי CHANNEL_ID.\n\n"
-            f"השגיאה שהתקבלה: {exc}\n\n"
-            "בדרך כלל זה אומר שה-CHANNEL_ID אינו נכון."
-        )
-    except Exception as exc:  # Keep the exact Telegram error visible during setup.
-        logger.exception("Unexpected channel test error")
-        await message.reply_text(
-            "❌ הפרסום לערוץ נכשל.\n\n"
-            f"שגיאה: {type(exc).__name__}: {exc}"
-        )
-
-
-async def channel_test_command(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    await publish_channel_test(update, context)
 
 
 async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -193,53 +366,138 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def echo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle ordinary private messages sent to the bot."""
     message = update.effective_message
     user = update.effective_user
-    chat = update.effective_chat
-
-    if message is None or not message.text or user is None or chat is None:
-        return
-
-    # Ignore channel/group posts. We currently accept input only in a private chat.
-    if chat.type != "private":
+    if message is None or not message.text or user is None:
         return
 
     text = message.text.strip()
 
-    # First integration test: sending "test" privately publishes to the channel.
     if text.lower() in {"test", "בדיקה"}:
-        await publish_channel_test(update, context)
+        await channel_test(update, context)
         return
 
-    # Keep the template's original message counter until CA handling is added.
-    client = context.bot_data.get(REDIS_KEY)
-    if client is not None:
-        count = await cache.increment_message_count(client, user.id)
-    else:
-        count = _LOCAL_MESSAGE_COUNTS[user.id] = (
-            _LOCAL_MESSAGE_COUNTS.get(user.id, 0) + 1
-        )
+    if not _admin_allowed(user.id):
+        await message.reply_text("⛔ אין לך הרשאה לפרסם המלצות דרך הבוט.")
+        return
 
-    await message.reply_text(
-        f"קיבלתי את ההודעה (#{count}).\n\n"
-        "כרגע לצורך הבדיקה שלח: test"
+    if not SOLANA_CA_RE.fullmatch(text):
+        await message.reply_text(
+            "שלח כתובת CA תקינה של Solana.\n\n"
+            "לדוגמה: כתובת Base58 באורך 32–44 תווים."
+        )
+        return
+
+    status = await message.reply_text("🔍 בודק את המטבע ב-DexScreener...")
+
+    try:
+        pair = await _fetch_best_pair(text)
+    except Exception as exc:
+        logger.exception("DexScreener request failed")
+        await status.edit_text(
+            "❌ לא הצלחתי לקבל כרגע נתונים מ-DexScreener.\n"
+            f"שגיאה: {exc}"
+        )
+        return
+
+    if not pair:
+        await status.edit_text("❌ לא מצאתי Pair של המטבע הזה ב-DexScreener.")
+        return
+
+    call = _call_data_from_pair(text, pair)
+    context.user_data["pending_call"] = call
+
+    buttons = [[
+        InlineKeyboardButton("✅ פרסם המלצה", callback_data="publish_call"),
+        InlineKeyboardButton("❌ ביטול", callback_data="cancel_call"),
+    ]]
+
+    if call.get("dex_url"):
+        buttons.append([InlineKeyboardButton("📈 DexScreener", url=call["dex_url"])])
+
+    await status.edit_text(
+        _preview_text(call),
+        reply_markup=InlineKeyboardMarkup(buttons),
+        disable_web_page_preview=True,
     )
+
+
+async def publish_call_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+
+    await query.answer()
+
+    if not _admin_allowed(user.id):
+        await query.edit_message_text("⛔ אין לך הרשאה לפרסם המלצות.")
+        return
+
+    call = context.user_data.get("pending_call")
+    if not call:
+        await query.edit_message_text(
+            "❌ התצוגה המקדימה כבר אינה זמינה. שלח שוב את ה-CA."
+        )
+        return
+
+    target = _channel_target()
+    if target is None:
+        await query.edit_message_text("❌ CHANNEL_ID לא מוגדר ב-Railway.")
+        return
+
+    keyboard = []
+    if call.get("dex_url"):
+        keyboard.append([InlineKeyboardButton("📈 DexScreener", url=call["dex_url"])])
+
+    try:
+        sent = await context.bot.send_message(
+            chat_id=target,
+            text=_channel_call_text(call),
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        logger.exception("Publishing call failed")
+        await query.edit_message_text(
+            "❌ לא הצלחתי לפרסם את ההמלצה בערוץ.\n\n"
+            f"שגיאה: {exc}"
+        )
+        return
+
+    context.user_data.pop("pending_call", None)
+
+    await query.edit_message_text(
+        "✅ ההמלצה פורסמה בערוץ.\n\n"
+        f"{call['name']} (${call['symbol']})\n"
+        f"Telegram message ID: {sent.message_id}"
+    )
+
+
+async def cancel_call_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    await query.answer()
+    context.user_data.pop("pending_call", None)
+    await query.edit_message_text("❌ פרסום ההמלצה בוטל.")
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
     message = update.effective_message
-    if message is None:
-        return
-
-    await message.reply_text("פקודה לא מוכרת. שלח /help לקבלת עזרה.")
+    if message is not None:
+        await message.reply_text("פקודה לא מוכרת. שלח /help לעזרה.")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     error = context.error
 
-    # Transient polling/network errors can occur briefly during Railway redeploys.
     if isinstance(error, (Conflict, NetworkError, TimedOut)):
         logger.warning("Transient Telegram error: %s", error)
         return
@@ -248,7 +506,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if isinstance(update, Update) and update.effective_message:
         await update.effective_message.reply_text(
-            "❌ אירעה שגיאה בזמן עיבוד ההודעה."
+            "מצטער, אירעה שגיאה בזמן עיבוד ההודעה."
         )
 
 
@@ -261,12 +519,23 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("about", about))
     application.add_handler(CommandHandler("ping", ping))
-    application.add_handler(CommandHandler("channeltest", channel_test_command))
-    application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+    application.add_handler(CommandHandler("myid", myid))
+    application.add_handler(CommandHandler("channeltest", channel_test))
+
+    application.add_handler(
+        CallbackQueryHandler(publish_call_callback, pattern=r"^publish_call$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(cancel_call_callback, pattern=r"^cancel_call$")
+    )
+
     application.add_handler(
         MessageHandler(
             filters.Regex(f"^({MENU_HELP}|{MENU_ABOUT}|{MENU_PING})$"),
             menu_button,
         )
     )
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_message))
+    application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, echo_message)
+    )
