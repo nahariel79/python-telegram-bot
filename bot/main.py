@@ -1,11 +1,12 @@
 """Entrypoint for the Telegram bot."""
 
+import asyncio
 import logging
 
 from telegram import Update
 from telegram.ext import Application, ApplicationBuilder
 
-from bot import cache, db
+from bot import cache, db, tracker
 from bot.config import Settings
 from bot.handlers import (
     DB_KEY,
@@ -17,6 +18,7 @@ from bot.handlers import (
 
 
 logger = logging.getLogger(__name__)
+TRACKER_TASK_KEY = "tracker_task"
 
 
 def configure_logging(level_name: str) -> None:
@@ -28,11 +30,6 @@ def configure_logging(level_name: str) -> None:
 
 
 async def _connect_optional(name, url, connect):
-    """Connect to an optional backend, returning None when unavailable.
-
-    Missing/empty URL -> skipped with a warning. Connection failure -> logged as
-    an error but the bot keeps running without that backend.
-    """
     if not url:
         logger.warning("%s URL not set - running without it.", name)
         return None
@@ -45,17 +42,29 @@ async def _connect_optional(name, url, connect):
 
 def build_application(settings: Settings) -> Application:
     async def on_startup(application: Application) -> None:
-        # Optional backends: the bot runs even when DATABASE_URL / REDIS_URL are
-        # missing or unreachable, degrading gracefully instead of refusing to start.
         application.bot_data[DB_KEY] = await _connect_optional(
             "PostgreSQL", settings.database_url, db.create_pool
         )
         application.bot_data[REDIS_KEY] = await _connect_optional(
             "Redis", settings.redis_url, cache.create_client
         )
+
         await set_bot_commands(application)
 
+        application.bot_data[TRACKER_TASK_KEY] = asyncio.create_task(
+            tracker.tracker_loop(application),
+            name="memecoin-call-tracker",
+        )
+
     async def on_shutdown(application: Application) -> None:
+        task = application.bot_data.get(TRACKER_TASK_KEY)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
         pool = application.bot_data.get(DB_KEY)
         if pool is not None:
             await db.close_pool(pool)
