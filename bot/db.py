@@ -608,6 +608,67 @@ async def get_daily_leaders(
     )
 
 
+async def get_weekly_leaders(
+    pool: asyncpg.Pool,
+    limit: int = 3,
+) -> list[asyncpg.Record]:
+    """Return the strongest calls from the last 7 days, ranked by ATH profit."""
+    return list(
+        await pool.fetch(
+            """
+            SELECT symbol, token_name, valuation_type, entry_valuation,
+                   highest_valuation, highest_profit_percent
+            FROM calls
+            WHERE call_time >= now() - interval '7 days'
+            ORDER BY
+                CASE
+                    WHEN entry_valuation > 0 THEN
+                        ((COALESCE(highest_valuation, entry_valuation) / entry_valuation) - 1.0) * 100.0
+                    ELSE 0.0
+                END DESC,
+                COALESCE(highest_valuation, entry_valuation) DESC,
+                call_time DESC
+            LIMIT $1;
+            """,
+            limit,
+        )
+    )
+
+
+async def get_all_time_performance_summary(
+    pool: asyncpg.Pool,
+) -> asyncpg.Record:
+    """Return all-time call count plus cumulative/average ATH profit percentages.
+
+    cumulative_ath_pnl_percent is the arithmetic sum of each call's ATH profit
+    percentage. It is a channel statistic, not a portfolio return calculation.
+    average_ath_profit_percent is that cumulative figure divided by call count.
+    """
+    return await pool.fetchrow(
+        """
+        WITH per_call AS (
+            SELECT
+                CASE
+                    WHEN entry_valuation > 0 THEN
+                        ((COALESCE(highest_valuation, entry_valuation) / entry_valuation) - 1.0) * 100.0
+                    ELSE 0.0
+                END AS ath_profit_percent
+            FROM calls
+        )
+        SELECT
+            COUNT(*)::BIGINT AS total_calls,
+            COALESCE(SUM(ath_profit_percent), 0.0)::DOUBLE PRECISION
+                AS cumulative_ath_pnl_percent,
+            CASE
+                WHEN COUNT(*) > 0 THEN
+                    (COALESCE(SUM(ath_profit_percent), 0.0) / COUNT(*))::DOUBLE PRECISION
+                ELSE 0.0::DOUBLE PRECISION
+            END AS average_ath_profit_percent
+        FROM per_call;
+        """
+    )
+
+
 async def get_stats_page(
     pool: asyncpg.Pool,
     period: str,

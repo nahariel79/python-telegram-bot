@@ -477,6 +477,68 @@ async def _historical_ath(call) -> tuple[float | None, datetime | None, str | No
 # ---------- Milestones ----------
 
 
+def _performance_badge(profit: float) -> str:
+    if profit >= 500:
+        return "🟣"
+    if profit >= 300:
+        return "🔥"
+    if profit >= 100:
+        return "🟢"
+    if profit >= 50:
+        return "🟡"
+    return "🔵"
+
+
+def _weekly_leaders_text(leaders) -> str:
+    if not leaders:
+        return (
+            "🏆 <b>המרוויחים הגבוהים של השבוע</b>\n"
+            "<i>עדיין אין מספיק המלצות ב־7 הימים האחרונים.</i>"
+        )
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [
+        "🏆 <b>המרוויחים הגבוהים של השבוע</b>",
+        "<i>לפי אחוז הרווח מה־ATH הגבוה לנמוך</i>",
+        "",
+    ]
+    for index, row in enumerate(leaders, start=1):
+        entry = float(row["entry_valuation"])
+        ath = float(row["highest_valuation"] or entry)
+        multiple = ath / entry if entry > 0 else 0.0
+        leader_profit = ((ath / entry) - 1.0) * 100.0 if entry > 0 else 0.0
+        symbol = html.escape(str(row["symbol"]))
+        medal = medals[index - 1] if index <= len(medals) else f"#{index}"
+        badge = _performance_badge(leader_profit)
+        lines.extend([
+            f"{medal} <b>${symbol}</b>",
+            f"{badge} <b>{leader_profit:+.0f}%  •  {multiple:.2f}X</b>",
+            f"🏆 <b>ATH {_fmt_usd(ath)}</b>  •  כניסה {_fmt_usd(entry)}",
+            "",
+        ])
+    return "\n".join(lines).rstrip()
+
+
+def _channel_stats_text(summary) -> str:
+    if not summary:
+        total = 0
+        cumulative = 0.0
+        average = 0.0
+    else:
+        total = int(summary["total_calls"] or 0)
+        cumulative = float(summary["cumulative_ath_pnl_percent"] or 0.0)
+        average = float(summary["average_ath_profit_percent"] or 0.0)
+
+    return (
+        "📊 <b>סטטיסטיקת הערוץ — כל הזמנים</b>\n"
+        f"🧾 <b>סה״כ המלצות:</b> {total:,}\n"
+        f"💹 <b>PNL מצטבר לפי ATH:</b> {cumulative:+,.1f}%\n"
+        f"📈 <b>רווח ATH ממוצע להמלצה:</b> {average:+,.1f}%\n\n"
+        "🔄 <i>הנתונים משתנים בזמן אמת ומתעדכנים לפי נתוני שוק אמיתיים.</i>\n"
+        "ℹ️ <i>PNL מצטבר הוא סכום אחוזי ה־ATH של כל ההמלצות, ולא תשואת תיק בפועל.</i>"
+    )
+
+
 def _milestone_message(
     call,
     milestone: int,
@@ -484,6 +546,8 @@ def _milestone_message(
     valuation: float,
     *,
     source: str,
+    weekly_leaders=None,
+    summary=None,
 ) -> str:
     multiple = valuation / float(call["entry_valuation"])
     metric = "MC" if call["valuation_type"] == "marketCap" else "FDV"
@@ -517,6 +581,10 @@ def _milestone_message(
 
     parts.extend([
         "",
+        "━━━━━━━━━━━━━━━━━━",
+        _weekly_leaders_text(weekly_leaders or []),
+        "━━━━━━━━━━━━━━━━━━",
+        _channel_stats_text(summary),
         "━━━━━━━━━━━━━━━━━━",
         "⚠️ <i>אזהרה: מסחר בקריפטו וב־Memecoins הוא תנודתי ומסוכן ועלול "
         "להביא לאובדן מלא של ההשקעה. אין בפרסום משום ייעוץ או המלצה אישית. "
@@ -570,6 +638,18 @@ async def _publish_milestone(
         keyboard = InlineKeyboardMarkup(fallback_rows) if fallback_rows else None
 
     try:
+        weekly_leaders = await db.get_weekly_leaders(pool, limit=3)
+    except Exception:
+        logger.exception("Could not load weekly leaders for milestone")
+        weekly_leaders = []
+
+    try:
+        performance_summary = await db.get_all_time_performance_summary(pool)
+    except Exception:
+        logger.exception("Could not load all-time performance summary for milestone")
+        performance_summary = None
+
+    try:
         sent = await application.bot.send_message(
             chat_id=call["channel_chat_id"],
             text=_milestone_message(
@@ -578,6 +658,8 @@ async def _publish_milestone(
                 profit,
                 valuation,
                 source=source,
+                weekly_leaders=weekly_leaders,
+                summary=performance_summary,
             ),
             parse_mode="HTML",
             reply_markup=keyboard,
