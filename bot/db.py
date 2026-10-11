@@ -544,7 +544,14 @@ async def get_calls_for_period(
             call_time
         FROM calls
         {where_clause}
-        ORDER BY call_time DESC;
+        ORDER BY
+            CASE
+                WHEN entry_valuation > 0 THEN
+                    ((COALESCE(highest_valuation, entry_valuation) / entry_valuation) - 1.0) * 100.0
+                ELSE 0.0
+            END DESC,
+            COALESCE(highest_valuation, entry_valuation) DESC,
+            call_time DESC;
     """
     return list(await pool.fetch(query))
 
@@ -586,7 +593,14 @@ async def get_daily_leaders(
                    highest_valuation, highest_profit_percent
             FROM calls
             WHERE call_time >= now() - interval '24 hours'
-            ORDER BY highest_profit_percent DESC, call_time DESC
+            ORDER BY
+                CASE
+                    WHEN entry_valuation > 0 THEN
+                        ((COALESCE(highest_valuation, entry_valuation) / entry_valuation) - 1.0) * 100.0
+                    ELSE 0.0
+                END DESC,
+                COALESCE(highest_valuation, entry_valuation) DESC,
+                call_time DESC
             LIMIT $1;
             """,
             limit,

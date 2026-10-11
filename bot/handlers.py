@@ -330,6 +330,18 @@ def _preview_text(call: dict) -> str:
     )
 
 
+def _leader_badge(profit: float) -> str:
+    if profit >= 500:
+        return "🟣"
+    if profit >= 300:
+        return "🔥"
+    if profit >= 100:
+        return "🟢"
+    if profit >= 50:
+        return "🟡"
+    return "🔵"
+
+
 def _daily_leaders_text(leaders) -> str:
     if not leaders:
         return (
@@ -338,16 +350,26 @@ def _daily_leaders_text(leaders) -> str:
         )
 
     medals = ["🥇", "🥈", "🥉"]
-    lines = ["🏆 <b>המובילים היומיים</b>"]
+    lines = [
+        "🏆 <b>המובילים היומיים</b>",
+        "<i>לפי אחוז הרווח מה־ATH הגבוה לנמוך</i>",
+        "",
+    ]
     for index, row in enumerate(leaders, start=1):
-        ath = float(row["highest_valuation"] or row["entry_valuation"])
-        profit = float(row["highest_profit_percent"] or 0.0)
+        entry = float(row["entry_valuation"])
+        ath = float(row["highest_valuation"] or entry)
+        multiple = ath / entry if entry > 0 else 0.0
+        profit = ((ath / entry) - 1.0) * 100.0 if entry > 0 else 0.0
         symbol = html.escape(str(row["symbol"]))
-        medal = medals[index - 1] if index <= len(medals) else f"{index}."
-        lines.append(
-            f"{medal} <b>${symbol}</b>  •  <b>{profit:+.0f}%</b>  •  ATH {_fmt_usd(ath)}"
-        )
-    return "\n".join(lines)
+        medal = medals[index - 1] if index <= len(medals) else f"#{index}"
+        badge = _leader_badge(profit)
+        lines.extend([
+            f"{medal} <b>${symbol}</b>",
+            f"{badge} <b>{profit:+.0f}%  •  {multiple:.2f}X</b>",
+            f"🏆 <b>ATH {_fmt_usd(ath)}</b>  •  כניסה {_fmt_usd(entry)}",
+            "",
+        ])
+    return "\n".join(lines).rstrip()
 
 
 def _channel_call_text(call: dict, leaders=None) -> str:
@@ -668,19 +690,39 @@ async def publish_call_callback(
         )
         return
 
-    # Create/update permanent list posts inside the channel, then point the call
-    # buttons directly to those posts. Subscribers never need to open the bot.
+    # IMPORTANT: the recommendation itself must always receive the daily leaders,
+    # even if a Telegram statistics page is temporarily stale/deleted.  In older
+    # versions these steps lived in one try block; one failed stats-page edit
+    # prevented both the leaders and the buttons from being attached.
+    try:
+        leaders = await db.get_daily_leaders(pool, limit=3)
+    except Exception:
+        logger.exception("Could not load daily leaders for the new call")
+        leaders = []
+
+    # Repair/create the channel-native list posts.  A failure here no longer
+    # prevents the recommendation text itself from being finalized.
     try:
         await stats.refresh_all_stats_pages(
             context.application,
             pool,
             channel_chat_id=sent.chat.id,
         )
-        leaders = await db.get_daily_leaders(pool, limit=3)
+    except Exception:
+        logger.exception("Could not refresh channel stats pages; continuing with call")
+
+    try:
         final_keyboard = await stats.recommendation_keyboard(
             pool,
             dex_url=call.get("dex_url"),
         )
+    except Exception:
+        logger.exception("Could not build stats keyboard; keeping DexScreener button")
+        final_keyboard = temp_keyboard
+
+    # Always perform this final edit.  This guarantees that daily leaders are
+    # shown on every new recommendation even if list-page maintenance failed.
+    try:
         await context.bot.edit_message_text(
             chat_id=sent.chat.id,
             message_id=sent.message_id,
@@ -690,7 +732,7 @@ async def publish_call_callback(
             disable_web_page_preview=True,
         )
     except Exception:
-        logger.exception("Call published, but stats/leaders refresh failed")
+        logger.exception("Could not finalize new call text/keyboard")
 
     context.user_data.pop("pending_call", None)
 

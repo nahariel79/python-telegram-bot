@@ -6,6 +6,7 @@ posts, so subscribers stay in the channel instead of being sent to a bot DM.
 """
 
 import asyncio
+import html
 import logging
 import os
 
@@ -63,32 +64,53 @@ def _message_url(message_id: int) -> str | None:
     return f"https://t.me/{username}/{message_id}"
 
 
+def _performance_badge(profit: float) -> str:
+    if profit >= 500:
+        return "🟣"
+    if profit >= 300:
+        return "🔥"
+    if profit >= 100:
+        return "🟢"
+    if profit >= 50:
+        return "🟡"
+    return "🔵"
+
+
 def _call_line(index: int, row) -> str:
     entry = float(row["entry_valuation"])
     ath = float(row["highest_valuation"] or entry)
     multiple = ath / entry if entry > 0 else 0.0
     profit = ((ath / entry) - 1.0) * 100.0 if entry > 0 else 0.0
     metric = "MC" if row["valuation_type"] == "marketCap" else "FDV"
+    symbol = html.escape(str(row["symbol"]))
+    medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(index, f"#{index}")
+    badge = _performance_badge(profit)
+
     return (
-        f"{index}. ${row['symbol']}\n"
-        f"   {metric} בפרסום: {_fmt_usd(entry)} | "
-        f"ATH: {_fmt_usd(ath)} | {multiple:.2f}X | {profit:+.0f}%"
+        f"{medal} <b>${symbol}</b>\n"
+        f"{badge} <b>רווח שיא: {profit:+.0f}%  •  {multiple:.2f}X</b>\n"
+        f"🏆 <b>ATH: {_fmt_usd(ath)}</b>\n"
+        f"▫️ {metric} בפרסום: {_fmt_usd(entry)}"
     )
 
 
 def _page_text(period: str, rows: list, page: int, pages: int, total: int) -> str:
     title = _period_title(period)
     if not rows:
-        return f"{title}\n\nאין עדיין המלצות בתקופה הזאת."
+        return f"<b>{title}</b>\n\nאין עדיין המלצות בתקופה הזאת."
 
     start_index = (page - 1) * CALLS_PER_PAGE + 1
-    body = "\n\n".join(
+    body = "\n\n━━━━━━━━━━━━━━━━━━\n\n".join(
         _call_line(start_index + i, row) for i, row in enumerate(rows)
     )
-    header = f"{title}\nסה״כ המלצות: {total}"
+    header = (
+        f"<b>{title}</b>\n"
+        f"📊 סה״כ המלצות: <b>{total}</b>\n"
+        "⬇️ <i>ממויין לפי אחוז הרווח מה־ATH הגבוה לנמוך</i>"
+    )
     if pages > 1:
-        header += f" | עמוד {page}/{pages}"
-    return f"{header}\n\n{body}\n\n🔄 הרשימה מתעדכנת אוטומטית."
+        header += f"\n📄 עמוד {page}/{pages}"
+    return f"{header}\n\n{body}\n\n🔄 <i>הרשימה מתעדכנת אוטומטית.</i>"
 
 
 async def _ensure_page(
@@ -105,7 +127,8 @@ async def _ensure_page(
 
     sent = await application.bot.send_message(
         chat_id=channel_chat_id,
-        text=f"{_period_title(period)}\n\nמכין את הרשימה...",
+        text=f"<b>{_period_title(period)}</b>\n\nמכין את הרשימה...",
+        parse_mode="HTML",
         disable_web_page_preview=True,
     )
     await db.upsert_stats_page(
@@ -116,6 +139,52 @@ async def _ensure_page(
         message_id=sent.message_id,
     )
     return sent.message_id
+
+
+async def _replace_missing_page(
+    application: Application,
+    pool,
+    *,
+    period: str,
+    page_number: int,
+    channel_chat_id: int,
+    text: str,
+    keyboard: InlineKeyboardMarkup | None,
+) -> int:
+    """Create a replacement when a saved Telegram stats post no longer exists."""
+    sent = await application.bot.send_message(
+        chat_id=channel_chat_id,
+        text=text,
+        parse_mode="HTML",
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+    await db.upsert_stats_page(
+        pool,
+        period=period,
+        page_number=page_number,
+        channel_chat_id=sent.chat.id,
+        message_id=sent.message_id,
+    )
+    logger.warning(
+        "Recreated missing stats page %s/%s as Telegram message %s",
+        period,
+        page_number,
+        sent.message_id,
+    )
+    return int(sent.message_id)
+
+
+def _is_missing_or_uneditable_message(exc: BadRequest) -> bool:
+    text = str(exc).lower()
+    markers = (
+        "message to edit not found",
+        "message can't be edited",
+        "message can not be edited",
+        "message_id_invalid",
+        "message identifier is not specified",
+    )
+    return any(marker in text for marker in markers)
 
 
 async def _all_page1_urls(pool) -> dict[str, str]:
@@ -173,7 +242,9 @@ async def refresh_stats_period(
         for i in range(0, len(calls), CALLS_PER_PAGE)
     ] or [[]]
 
-    # Ensure all required page messages exist first so navigation URLs are stable.
+    # Ensure DB records/messages exist. Existing DB rows can become stale when a
+    # stats post is manually deleted from Telegram; the edit loop below repairs
+    # those rows automatically.
     page_ids: list[int] = []
     for page_number in range(1, len(chunks) + 1):
         page_ids.append(
@@ -186,7 +257,6 @@ async def refresh_stats_period(
             )
         )
 
-    # Page 1 for all periods must exist so every stats page can cross-link.
     for other_period in PERIODS:
         await _ensure_page(
             application,
@@ -196,35 +266,63 @@ async def refresh_stats_period(
             channel_chat_id=channel_chat_id,
         )
 
-    page1_urls = await _all_page1_urls(pool)
+    async def render_once() -> bool:
+        """Render pages; return True if any stale Telegram post was recreated."""
+        recreated = False
+        page1_urls = await _all_page1_urls(pool)
 
-    for page_number, (message_id, rows) in enumerate(zip(page_ids, chunks), start=1):
-        prev_url = _message_url(page_ids[page_number - 2]) if page_number > 1 else None
-        next_url = _message_url(page_ids[page_number]) if page_number < len(page_ids) else None
-        keyboard = _page_keyboard(
-            page1_urls=page1_urls,
-            prev_url=prev_url,
-            next_url=next_url,
-        )
-        text = _page_text(
-            period,
-            rows,
-            page_number,
-            len(chunks),
-            len(calls),
-        )
-        try:
-            await application.bot.edit_message_text(
-                chat_id=channel_chat_id,
-                message_id=message_id,
-                text=text,
-                reply_markup=keyboard,
-                disable_web_page_preview=True,
+        for idx, rows in enumerate(chunks):
+            page_number = idx + 1
+            message_id = page_ids[idx]
+            prev_url = _message_url(page_ids[idx - 1]) if idx > 0 else None
+            next_url = _message_url(page_ids[idx + 1]) if idx + 1 < len(page_ids) else None
+            keyboard = _page_keyboard(
+                page1_urls=page1_urls,
+                prev_url=prev_url,
+                next_url=next_url,
             )
-        except BadRequest as exc:
-            # Telegram returns this when text/markup is already identical.
-            if "message is not modified" not in str(exc).lower():
+            text = _page_text(
+                period,
+                rows,
+                page_number,
+                len(chunks),
+                len(calls),
+            )
+
+            try:
+                await application.bot.edit_message_text(
+                    chat_id=channel_chat_id,
+                    message_id=message_id,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=keyboard,
+                    disable_web_page_preview=True,
+                )
+            except BadRequest as exc:
+                error_text = str(exc).lower()
+                if "message is not modified" in error_text:
+                    continue
+                if _is_missing_or_uneditable_message(exc):
+                    page_ids[idx] = await _replace_missing_page(
+                        application,
+                        pool,
+                        period=period,
+                        page_number=page_number,
+                        channel_chat_id=channel_chat_id,
+                        text=text,
+                        keyboard=keyboard,
+                    )
+                    recreated = True
+                    continue
                 raise
+
+        return recreated
+
+    # First pass repairs stale/deleted posts. If a message ID changed, a second
+    # pass rebuilds all navigation URLs so every button points at the new post.
+    recreated = await render_once()
+    if recreated:
+        await render_once()
 
     # Remove obsolete extra pages, e.g. when daily calls age out.
     existing_pages = await db.list_stats_pages(pool, period)
@@ -258,7 +356,8 @@ async def refresh_all_stats_pages(
     *,
     channel_chat_id: int,
 ) -> None:
-    # First guarantee page 1 for all periods, then render all periods.
+    # First guarantee page 1 records for all periods. Each period refresh can
+    # transparently replace a stale/deleted Telegram post and update the DB.
     for period in PERIODS:
         await _ensure_page(
             application,
@@ -268,6 +367,16 @@ async def refresh_all_stats_pages(
             channel_chat_id=channel_chat_id,
         )
 
+    for period in PERIODS:
+        await refresh_stats_period(
+            application,
+            pool,
+            period=period,
+            channel_chat_id=channel_chat_id,
+        )
+
+    # A later period may have recreated its page-1 message ID. Re-render once
+    # more so the day/week/all cross-links everywhere point to the latest IDs.
     for period in PERIODS:
         await refresh_stats_period(
             application,
