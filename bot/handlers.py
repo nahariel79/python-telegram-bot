@@ -1,6 +1,8 @@
 """Telegram update handlers for the memecoin calls bot."""
 
 import asyncio
+import csv
+import io
 import html
 import json
 import logging
@@ -8,10 +10,12 @@ import os
 import re
 import urllib.request
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputFile,
     ReplyKeyboardMarkup,
     Update,
 )
@@ -85,8 +89,8 @@ def _lists_keyboard(bot_username: str, dex_url: str | None = None) -> InlineKeyb
             url=_bot_deep_link(bot_username, "calls_day"),
         ),
         InlineKeyboardButton(
-            "📅 שבועי",
-            url=_bot_deep_link(bot_username, "calls_week"),
+            "🗓 חודשי",
+            url=_bot_deep_link(bot_username, "calls_month"),
         ),
     ])
     rows.append([
@@ -100,10 +104,19 @@ def _lists_keyboard(bot_username: str, dex_url: str | None = None) -> InlineKeyb
 
 def _period_title(period: str) -> str:
     return {
-        "day": "📋 המלצות יומיות — 24 השעות האחרונות",
-        "week": "📅 המלצות שבועיות — 7 הימים האחרונים",
-        "all": "🏆 כל ההמלצות — כל הזמנים",
+        "day": "🏆 המובילים היומיים — 24 השעות האחרונות",
+        "month": "🗓 המובילים החודשיים — 30 הימים האחרונים",
+        "all": "🏆 כל הזמנים",
     }[period]
+
+
+def _format_call_time_israel(value) -> str:
+    if value is None:
+        return "לא זמין"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    local = value.astimezone(ZoneInfo("Asia/Jerusalem"))
+    return local.strftime("%d/%m/%Y • %H:%M")
 
 
 def _call_list_item(row) -> str:
@@ -115,9 +128,10 @@ def _call_list_item(row) -> str:
 
     return (
         f"🪙 {row['symbol']}\n"
-        f"💰 {metric} בפרסום: {_fmt_usd(entry)}\n"
-        f"🏆 ATH מאז הפרסום: {_fmt_usd(ath)} "
-        f"• {multiple:.2f}X • {profit:+.0f}%"
+        f"💰 {metric} בזמן ההמלצה: {_fmt_usd(entry)}\n"
+        f"🕒 פורסם: {_format_call_time_israel(row['call_time'])}\n"
+        f"📈 רווח לפי ATH: {profit:+.0f}% • {multiple:.2f}X\n"
+        f"🏆 ATH: {_fmt_usd(ath)}"
     )
 
 
@@ -330,62 +344,12 @@ def _preview_text(call: dict) -> str:
     )
 
 
-def _leader_badge(profit: float) -> str:
-    if profit >= 500:
-        return "🟣"
-    if profit >= 300:
-        return "🔥"
-    if profit >= 100:
-        return "🟢"
-    if profit >= 50:
-        return "🟡"
-    return "🔵"
 
-
-def _leaders_text(leaders, *, title: str, empty_text: str) -> str:
-    if not leaders:
-        return f"🏆 <b>{title}</b>\n<i>{empty_text}</i>"
-
-    medals = ["🥇", "🥈", "🥉"]
-    lines = [
-        f"🏆 <b>{title}</b>",
-        "<i>לפי אחוז הרווח מה־ATH הגבוה לנמוך</i>",
-        "",
-    ]
-    for index, row in enumerate(leaders, start=1):
-        entry = float(row["entry_valuation"])
-        ath = float(row["highest_valuation"] or entry)
-        multiple = ath / entry if entry > 0 else 0.0
-        profit = ((ath / entry) - 1.0) * 100.0 if entry > 0 else 0.0
-        symbol = html.escape(str(row["symbol"]))
-        medal = medals[index - 1] if index <= len(medals) else f"#{index}"
-        badge = _leader_badge(profit)
-        lines.extend([
-            f"{medal} <b>${symbol}</b>",
-            f"{badge} <b>{profit:+.0f}%  •  {multiple:.2f}X</b>",
-            f"🏆 <b>ATH {_fmt_usd(ath)}</b>  •  כניסה {_fmt_usd(entry)}",
-            "",
-        ])
-    return "\n".join(lines).rstrip()
-
-
-def _daily_leaders_text(leaders) -> str:
-    return _leaders_text(
-        leaders,
-        title="המובילים היומיים",
-        empty_text="עדיין אין מספיק המלצות ב־24 השעות האחרונות.",
-    )
-
-
-def _channel_call_text(
-    call: dict,
-    daily_leaders=None,
-) -> str:
+def _channel_call_text(call: dict) -> str:
     metric = "MC" if call["valuation_type"] == "marketCap" else "FDV"
     name = html.escape(str(call["name"]))
     symbol = html.escape(str(call["symbol"]))
     token_address = html.escape(str(call["token_address"]))
-    daily_block = _daily_leaders_text(daily_leaders or [])
 
     return (
         "🚨🚨 <b>CALL חדש</b> 🚨🚨\n"
@@ -398,11 +362,87 @@ def _channel_call_text(
         "📍 <b>CA</b>\n"
         f"<code>{token_address}</code>\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"{daily_block}\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
         "⚠️ <i>אזהרה: מסחר בקריפטו וב־Memecoins הוא תנודתי ומסוכן ועלול להביא "
         "לאובדן מלא של ההשקעה. אין בפרסום משום ייעוץ או המלצה אישית. "
         "כל החלטת מסחר היא באחריות המשתמש בלבד.</i>"
+    )
+
+
+async def _send_calls_csv(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    period: str,
+) -> None:
+    """Send a follower a CSV snapshot of the selected ranked list."""
+    pool = context.bot_data.get(DB_KEY)
+    if pool is None:
+        await message.reply_text("❌ מסד הנתונים אינו זמין כרגע.")
+        return
+
+    rows = await db.get_calls_for_period(pool, period)
+    if not rows:
+        await message.reply_text("אין עדיין המלצות לייצוא בתקופה הזאת.")
+        return
+
+    period_name = {
+        "day": "daily",
+        "month": "monthly",
+        "all": "all_time",
+    }[period]
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Rank",
+        "Symbol",
+        "Token Name",
+        "CA",
+        "Recommendation Date (Israel)",
+        "Recommendation Time (Israel)",
+        "Entry Metric",
+        "Entry MC/FDV USD",
+        "ATH MC/FDV USD",
+        "ATH Profit %",
+        "ATH Multiple X",
+        "DexScreener",
+    ])
+
+    israel = ZoneInfo("Asia/Jerusalem")
+    for index, row in enumerate(rows, start=1):
+        entry = float(row["entry_valuation"])
+        ath = float(row["highest_valuation"] or entry)
+        profit = ((ath / entry) - 1.0) * 100.0 if entry > 0 else 0.0
+        multiple = ath / entry if entry > 0 else 0.0
+        call_time = row["call_time"]
+        if call_time.tzinfo is None:
+            call_time = call_time.replace(tzinfo=timezone.utc)
+        call_time = call_time.astimezone(israel)
+        metric = "MC" if row["valuation_type"] == "marketCap" else "FDV"
+
+        writer.writerow([
+            index,
+            row["symbol"],
+            row["token_name"],
+            row["token_address"],
+            call_time.strftime("%d/%m/%Y"),
+            call_time.strftime("%H:%M"),
+            metric,
+            f"{entry:.8f}",
+            f"{ath:.8f}",
+            f"{profit:.2f}",
+            f"{multiple:.4f}",
+            row["dexscreener_url"] or "",
+        ])
+
+    # UTF-8 BOM keeps Hebrew readable when the CSV is opened in Excel.
+    data = io.BytesIO(output.getvalue().encode("utf-8-sig"))
+    filename = f"memecoin_calls_{period_name}.csv"
+    await message.reply_document(
+        document=InputFile(data, filename=filename),
+        caption=(
+            "📥 קובץ ההמלצות להורדה.\n"
+            "הנתונים משקפים את ה־ATH שנשמר במערכת בזמן יצירת הקובץ."
+        ),
     )
 
 
@@ -420,12 +460,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     payload = context.args[0] if context.args else None
     payload_to_period = {
         "calls_day": "day",
-        "calls_week": "week",
+        "calls_month": "month",
         "calls_all": "all",
+    }
+    export_to_period = {
+        "export_day": "day",
+        "export_month": "month",
+        "export_all": "all",
     }
 
     if payload in payload_to_period:
         await _send_calls_list(message, context, payload_to_period[payload])
+        return
+
+    if payload in export_to_period:
+        await _send_calls_csv(message, context, export_to_period[payload])
         return
 
     name = user.first_name if user.first_name else "friend"
@@ -642,7 +691,7 @@ async def publish_call_callback(
     try:
         sent = await context.bot.send_message(
             chat_id=target,
-            text=_channel_call_text(call, []),
+            text=_channel_call_text(call),
             parse_mode="HTML",
             reply_markup=temp_keyboard,
             disable_web_page_preview=True,
@@ -698,16 +747,6 @@ async def publish_call_callback(
         )
         return
 
-    # IMPORTANT: the recommendation itself must always receive the daily leaders,
-    # even if a Telegram statistics page is temporarily stale/deleted.  In older
-    # versions these steps lived in one try block; one failed stats-page edit
-    # prevented both the leaders and the buttons from being attached.
-    try:
-        daily_leaders = await db.get_daily_leaders(pool, limit=3)
-    except Exception:
-        logger.exception("Could not load daily leaders for the new call")
-        daily_leaders = []
-
     # Repair/create the channel-native list posts.  A failure here no longer
     # prevents the recommendation text itself from being finalized.
     try:
@@ -728,13 +767,12 @@ async def publish_call_callback(
         logger.exception("Could not build stats keyboard; keeping DexScreener button")
         final_keyboard = temp_keyboard
 
-    # Always perform this final edit.  This guarantees that daily leaders are
-    # shown on every new recommendation even if list-page maintenance failed.
+    # Finalize the recommendation with the persistent list buttons.
     try:
         await context.bot.edit_message_text(
             chat_id=sent.chat.id,
             message_id=sent.message_id,
-            text=_channel_call_text(call, daily_leaders),
+            text=_channel_call_text(call),
             parse_mode="HTML",
             reply_markup=final_keyboard,
             disable_web_page_preview=True,

@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 CREATE_STATS_PAGES_TABLE = """
 CREATE TABLE IF NOT EXISTS stats_pages (
-    period          TEXT NOT NULL CHECK (period IN ('day', 'week', 'all')),
+    period          TEXT NOT NULL CHECK (period IN ('day', 'week', 'month', 'all')),
     page_number     INTEGER NOT NULL,
     channel_chat_id BIGINT NOT NULL,
     message_id      BIGINT NOT NULL,
@@ -136,7 +136,7 @@ MIGRATIONS: list[tuple[str, str]] = [
         "2026_10_11_stage6_channel_stats_and_duplicate_guard",
         """
         CREATE TABLE IF NOT EXISTS stats_pages (
-            period          TEXT NOT NULL CHECK (period IN ('day', 'week', 'all')),
+            period          TEXT NOT NULL CHECK (period IN ('day', 'week', 'month', 'all')),
             page_number     INTEGER NOT NULL,
             channel_chat_id BIGINT NOT NULL,
             message_id      BIGINT NOT NULL,
@@ -165,6 +165,15 @@ MIGRATIONS: list[tuple[str, str]] = [
         """,
     ),
 
+    (
+        "2026_10_12_stage12_monthly_lists",
+        """
+        ALTER TABLE stats_pages DROP CONSTRAINT IF EXISTS stats_pages_period_check;
+        ALTER TABLE stats_pages
+        ADD CONSTRAINT stats_pages_period_check
+        CHECK (period IN ('day', 'week', 'month', 'all'));
+        """,
+    ),
 ]
 
 UPSERT_USER = """
@@ -517,10 +526,13 @@ async def get_calls_for_period(
     pool: asyncpg.Pool,
     period: str,
 ) -> list[asyncpg.Record]:
-    """Return calls for daily, weekly, or all-time lists."""
+    """Return calls for daily, monthly, or all-time leader lists."""
     if period == "day":
         where_clause = "WHERE call_time >= now() - interval '24 hours'"
+    elif period == "month":
+        where_clause = "WHERE call_time >= now() - interval '30 days'"
     elif period == "week":
+        # Legacy compatibility only; Stage 12 no longer links to weekly lists.
         where_clause = "WHERE call_time >= now() - interval '7 days'"
     elif period == "all":
         where_clause = ""

@@ -43,8 +43,8 @@ def _milestone_keyboard(
             url=_bot_deep_link(bot_username, "calls_day"),
         ),
         InlineKeyboardButton(
-            "📅 שבועי",
-            url=_bot_deep_link(bot_username, "calls_week"),
+            "🗓 חודשי",
+            url=_bot_deep_link(bot_username, "calls_month"),
         ),
     ])
     rows.append([
@@ -489,35 +489,6 @@ def _performance_badge(profit: float) -> str:
     return "🔵"
 
 
-def _daily_leaders_text(leaders) -> str:
-    if not leaders:
-        return (
-            "🏆 <b>המובילים היומיים</b>\n"
-            "<i>עדיין אין מספיק המלצות ב־24 השעות האחרונות.</i>"
-        )
-
-    medals = ["🥇", "🥈", "🥉"]
-    lines = [
-        "🏆 <b>המובילים היומיים</b>",
-        "<i>לפי אחוז הרווח מה־ATH הגבוה לנמוך</i>",
-        "",
-    ]
-    for index, row in enumerate(leaders, start=1):
-        entry = float(row["entry_valuation"])
-        ath = float(row["highest_valuation"] or entry)
-        multiple = ath / entry if entry > 0 else 0.0
-        profit = ((ath / entry) - 1.0) * 100.0 if entry > 0 else 0.0
-        symbol = html.escape(str(row["symbol"]))
-        medal = medals[index - 1] if index <= len(medals) else f"#{index}"
-        badge = _performance_badge(profit)
-        lines.extend([
-            f"{medal} <b>${symbol}</b>",
-            f"{badge} <b>{profit:+.0f}%  •  {multiple:.2f}X</b>",
-            f"🏆 <b>ATH {_fmt_usd(ath)}</b>  •  כניסה {_fmt_usd(entry)}",
-            "",
-        ])
-    return "\n".join(lines).rstrip()
-
 
 def _milestone_message(
     call,
@@ -526,7 +497,6 @@ def _milestone_message(
     valuation: float,
     *,
     source: str,
-    daily_leaders=None,
 ) -> str:
     multiple = valuation / float(call["entry_valuation"])
     metric = "MC" if call["valuation_type"] == "marketCap" else "FDV"
@@ -560,8 +530,6 @@ def _milestone_message(
 
     parts.extend([
         "",
-        "━━━━━━━━━━━━━━━━━━",
-        _daily_leaders_text(daily_leaders or []),
         "━━━━━━━━━━━━━━━━━━",
         "⚠️ <i>אזהרה: מסחר בקריפטו וב־Memecoins הוא תנודתי ומסוכן ועלול "
         "להביא לאובדן מלא של ההשקעה. אין בפרסום משום ייעוץ או המלצה אישית. "
@@ -614,12 +582,6 @@ async def _publish_milestone(
             fallback_rows.append([InlineKeyboardButton("📈 DexScreener", url=final_dex_url)])
         keyboard = InlineKeyboardMarkup(fallback_rows) if fallback_rows else None
 
-    try:
-        daily_leaders = await db.get_daily_leaders(pool, limit=3)
-    except Exception:
-        logger.exception("Could not load daily leaders for milestone")
-        daily_leaders = []
-
 
     try:
         sent = await application.bot.send_message(
@@ -630,7 +592,6 @@ async def _publish_milestone(
                 profit,
                 valuation,
                 source=source,
-                daily_leaders=daily_leaders,
             ),
             parse_mode="HTML",
             reply_markup=keyboard,
