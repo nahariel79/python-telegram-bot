@@ -500,6 +500,7 @@ def _milestone_message(
 ) -> str:
     multiple = valuation / float(call["entry_valuation"])
     metric = "MC" if call["valuation_type"] == "marketCap" else "FDV"
+    token_name = html.escape(str(call["token_name"]))
     symbol = html.escape(str(call["symbol"]))
 
     if source == "history":
@@ -514,7 +515,8 @@ def _milestone_message(
     parts = [
         "💥💥💥 <b>יעד רווח הושג!</b> 💥💥💥",
         "━━━━━━━━━━━━━━━━━━",
-        f"🚀 <b>${symbol}  •  +{milestone}%</b>",
+        f"🪙 <b>{token_name} (${symbol})</b>",
+        f"🚀 <b>יעד: +{milestone}%</b>",
         f"🔥 <b>{multiple:.2f}X מאז ההמלצה</b>",
         "━━━━━━━━━━━━━━━━━━",
         status_title,
@@ -564,18 +566,29 @@ async def _publish_milestone(
     if not claimed:
         return False
 
+    # Refreshing the list contents and building the buttons are intentionally
+    # independent. A temporary failure while editing one list must NEVER strip
+    # the daily/monthly/all-time buttons from a milestone post.
     try:
         await stats.refresh_all_stats_pages(
             application,
             pool,
             channel_chat_id=int(call["channel_chat_id"]),
         )
+    except Exception:
+        logger.exception("Could not refresh channel list pages before milestone; keeping list buttons")
+
+    try:
         keyboard = await stats.recommendation_keyboard(
+            application,
             pool,
+            channel_chat_id=int(call["channel_chat_id"]),
             dex_url=dex_url or call["dexscreener_url"],
         )
     except Exception:
-        logger.exception("Could not refresh channel list pages before milestone")
+        logger.exception("Could not build channel list buttons for milestone")
+        # Last-resort fallback keeps DexScreener visible. The stats refresh loop
+        # will repair the channel-native list pages for the next post.
         fallback_rows = []
         final_dex_url = dex_url or call["dexscreener_url"]
         if final_dex_url:

@@ -361,24 +361,73 @@ async def _remove_legacy_weekly_pages(application: Application, pool) -> None:
 async def refresh_all_stats_pages(application: Application, pool, *, channel_chat_id: int) -> None:
     await _remove_legacy_weekly_pages(application, pool)
 
+    # Ensure the three permanent entry posts exist first. Each period renderer
+    # already performs a second render internally if it had to recreate a page,
+    # so one pass here is sufficient and avoids needless Telegram edits.
     for period in PERIODS:
-        await _ensure_page(
-            application, pool, period=period, page_number=1, channel_chat_id=channel_chat_id
-        )
+        try:
+            await _ensure_page(
+                application,
+                pool,
+                period=period,
+                page_number=1,
+                channel_chat_id=channel_chat_id,
+            )
+        except Exception:
+            logger.exception("Could not ensure stats page %s/1", period)
+
+    # A failure in one period must not prevent the other lists from updating.
+    for period in PERIODS:
+        try:
+            await refresh_stats_period(
+                application,
+                pool,
+                period=period,
+                channel_chat_id=channel_chat_id,
+            )
+        except Exception:
+            logger.exception("Could not refresh stats period %s", period)
+
+
+async def recommendation_keyboard(
+    application: Application,
+    pool,
+    *,
+    channel_chat_id: int,
+    dex_url: str | None,
+) -> InlineKeyboardMarkup:
+    """Build persistent channel-native ranking buttons.
+
+    This function is deliberately defensive: if a primary list post has never
+    been created, it creates the placeholder immediately. Failures are isolated
+    per period so one broken list can never remove the other buttons.
+    """
+    page1_urls: dict[str, str] = {}
 
     for period in PERIODS:
-        await refresh_stats_period(
-            application, pool, period=period, channel_chat_id=channel_chat_id
-        )
+        try:
+            message_id = await _ensure_page(
+                application,
+                pool,
+                period=period,
+                page_number=1,
+                channel_chat_id=channel_chat_id,
+            )
+            url = _message_url(int(message_id))
+            if url:
+                page1_urls[period] = url
+        except Exception:
+            logger.exception("Could not prepare recommendation button for %s", period)
+            # If creation failed but an older DB record exists, still expose it.
+            try:
+                existing = await db.get_stats_page(pool, period, 1)
+                if existing:
+                    url = _message_url(int(existing["message_id"]))
+                    if url:
+                        page1_urls[period] = url
+            except Exception:
+                logger.exception("Could not recover stored stats URL for %s", period)
 
-    for period in PERIODS:
-        await refresh_stats_period(
-            application, pool, period=period, channel_chat_id=channel_chat_id
-        )
-
-
-async def recommendation_keyboard(pool, *, dex_url: str | None) -> InlineKeyboardMarkup:
-    page1_urls = await _all_page1_urls(pool)
     rows = []
     if dex_url:
         rows.append([InlineKeyboardButton("📈 DexScreener", url=dex_url)])
@@ -390,6 +439,7 @@ async def recommendation_keyboard(pool, *, dex_url: str | None) -> InlineKeyboar
         row.append(InlineKeyboardButton("🗓 מובילים חודשיים", url=page1_urls["month"]))
     if row:
         rows.append(row)
+
     if page1_urls.get("all"):
         rows.append([InlineKeyboardButton("🌟 כל הזמנים", url=page1_urls["all"])])
 

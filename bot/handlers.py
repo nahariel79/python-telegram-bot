@@ -760,7 +760,9 @@ async def publish_call_callback(
 
     try:
         final_keyboard = await stats.recommendation_keyboard(
+            context.application,
             pool,
+            channel_chat_id=sent.chat.id,
             dex_url=call.get("dex_url"),
         )
     except Exception:
