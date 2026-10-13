@@ -366,7 +366,11 @@ async def get_call_due_for_history(
               history_checked_at IS NULL
               OR history_checked_at < now() - ($1 * interval '1 second')
           )
-        ORDER BY history_checked_at ASC NULLS FIRST, call_time ASC
+        ORDER BY
+            CASE WHEN history_checked_at IS NULL THEN 0 ELSE 1 END ASC,
+            CASE WHEN history_checked_at IS NULL THEN call_time END DESC,
+            history_checked_at ASC NULLS FIRST,
+            call_time DESC
         LIMIT 1;
         """,
         recheck_seconds,
@@ -553,15 +557,21 @@ async def get_calls_for_period(
             ath_source,
             history_checked_at,
             dexscreener_url,
-            call_time
+            current_dexscreener_url,
+            telegram_message_id,
+            call_time,
+            last_checked_at
         FROM calls
         {where_clause}
         ORDER BY
-            CASE
-                WHEN entry_valuation > 0 THEN
-                    ((COALESCE(highest_valuation, entry_valuation) / entry_valuation) - 1.0) * 100.0
-                ELSE 0.0
-            END DESC,
+            GREATEST(
+                COALESCE(highest_profit_percent, 0.0),
+                CASE
+                    WHEN entry_valuation > 0 THEN
+                        ((COALESCE(highest_valuation, entry_valuation) / entry_valuation) - 1.0) * 100.0
+                    ELSE 0.0
+                END
+            ) DESC,
             COALESCE(highest_valuation, entry_valuation) DESC,
             call_time DESC;
     """
@@ -734,6 +744,40 @@ async def delete_stats_page_record(
     await pool.execute(
         "DELETE FROM stats_pages WHERE period=$1 AND page_number=$2;",
         period, page_number,
+    )
+
+
+async def get_posts_for_keyboard_repair(pool: asyncpg.Pool) -> list[asyncpg.Record]:
+    """Return every published call/milestone post that should carry live list buttons."""
+    return list(
+        await pool.fetch(
+            """
+            SELECT DISTINCT ON (channel_chat_id, telegram_message_id)
+                channel_chat_id,
+                telegram_message_id,
+                dexscreener_url
+            FROM (
+                SELECT
+                    c.channel_chat_id,
+                    c.telegram_message_id,
+                    COALESCE(c.current_dexscreener_url, c.dexscreener_url) AS dexscreener_url
+                FROM calls c
+                WHERE c.telegram_message_id IS NOT NULL
+
+                UNION ALL
+
+                SELECT
+                    c.channel_chat_id,
+                    m.telegram_message_id,
+                    COALESCE(c.current_dexscreener_url, c.dexscreener_url) AS dexscreener_url
+                FROM milestones m
+                JOIN calls c ON c.id = m.call_id
+                WHERE m.telegram_message_id IS NOT NULL
+                  AND m.published_at IS NOT NULL
+            ) AS posts
+            ORDER BY channel_chat_id, telegram_message_id;
+            """
+        )
     )
 
 

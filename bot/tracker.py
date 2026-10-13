@@ -643,85 +643,91 @@ async def check_calls_once(application: Application) -> None:
         return
 
     try:
-        pair_refresh_seconds = max(
-            60,
-            int(os.getenv("PAIR_REFRESH_SECONDS", "300")),
-        )
+        pair_refresh_seconds = max(60, int(os.getenv("PAIR_REFRESH_SECONDS", "300")))
     except ValueError:
         pair_refresh_seconds = 300
 
+    try:
+        concurrency = max(1, min(10, int(os.getenv("TRACK_CONCURRENCY", "6"))))
+    except ValueError:
+        concurrency = 6
+
     calls = await db.get_active_calls(pool)
+    semaphore = asyncio.Semaphore(concurrency)
 
-    for call in calls:
-        try:
-            pair_address, dex_url = await _resolve_live_pair(
-                pool,
-                call,
-                pair_refresh_seconds,
-            )
-
-            pair = await _fetch_pair(pair_address)
-            if not pair and pair_address != call["pair_address"]:
-                pair = await _fetch_pair(call["pair_address"])
-                dex_url = call["dexscreener_url"]
-
-            if not pair:
-                logger.warning(
-                    "No DexScreener pair data for call %s (%s)",
-                    call["id"],
-                    call["symbol"],
+    async def check_one(call) -> None:
+        async with semaphore:
+            try:
+                pair_address, dex_url = await _resolve_live_pair(
+                    pool,
+                    call,
+                    pair_refresh_seconds,
                 )
-                continue
 
-            current_price = _to_float(pair.get("priceUsd"))
-            current_valuation = _to_float(pair.get(call["valuation_type"]))
+                pair = await _fetch_pair(pair_address)
+                if not pair and pair_address != call["pair_address"]:
+                    pair = await _fetch_pair(call["pair_address"])
+                    dex_url = call["dexscreener_url"]
 
-            if current_valuation is None or current_valuation <= 0:
-                logger.warning(
-                    "No usable %s for call %s",
-                    call["valuation_type"],
-                    call["id"],
+                if not pair:
+                    logger.warning(
+                        "No DexScreener pair data for call %s (%s)",
+                        call["id"],
+                        call["symbol"],
+                    )
+                    return
+
+                current_price = _to_float(pair.get("priceUsd"))
+                current_valuation = _to_float(pair.get(call["valuation_type"]))
+
+                if current_valuation is None or current_valuation <= 0:
+                    logger.warning(
+                        "No usable %s for call %s",
+                        call["valuation_type"],
+                        call["id"],
+                    )
+                    return
+
+                entry = float(call["entry_valuation"])
+                profit = ((current_valuation / entry) - 1.0) * 100.0
+                observed_high = max(entry, current_valuation)
+                observed_high_profit = max(0.0, ((observed_high / entry) - 1.0) * 100.0)
+
+                await db.update_call_snapshot(
+                    pool,
+                    call_id=call["id"],
+                    current_price=current_price,
+                    current_valuation=current_valuation,
+                    observed_high_valuation=observed_high,
+                    observed_high_profit_percent=observed_high_profit,
                 )
-                continue
 
-            entry = float(call["entry_valuation"])
-            profit = ((current_valuation / entry) - 1.0) * 100.0
-            observed_high = max(entry, current_valuation)
-            observed_high_profit = max(0.0, ((observed_high / entry) - 1.0) * 100.0)
+                if profit < 100:
+                    return
 
-            await db.update_call_snapshot(
-                pool,
-                call_id=call["id"],
-                current_price=current_price,
-                current_valuation=current_valuation,
-                observed_high_valuation=observed_high,
-                observed_high_profit_percent=observed_high_profit,
-            )
+                milestone = int(profit // 100) * 100
+                if milestone <= int(call["highest_milestone"] or 0):
+                    return
 
-            if profit < 100:
-                continue
+                await _publish_milestone(
+                    application,
+                    pool,
+                    call,
+                    milestone=milestone,
+                    profit=profit,
+                    valuation=current_valuation,
+                    price=current_price,
+                    reached_at=datetime.now(timezone.utc),
+                    source="live",
+                    dex_url=dex_url,
+                )
 
-            milestone = int(profit // 100) * 100
-            if milestone <= int(call["highest_milestone"] or 0):
-                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Live tracker failed on call %s", call["id"])
 
-            await _publish_milestone(
-                application,
-                pool,
-                call,
-                milestone=milestone,
-                profit=profit,
-                valuation=current_valuation,
-                price=current_price,
-                reached_at=datetime.now(timezone.utc),
-                source="live",
-                dex_url=dex_url,
-            )
-
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Live tracker failed on call %s", call["id"])
+    await asyncio.gather(*(check_one(call) for call in calls))
 
 
 async def live_tracker_loop(application: Application) -> None:
@@ -827,22 +833,28 @@ async def reconcile_one_history(application: Application) -> None:
 
 async def history_reconciliation_loop(application: Application) -> None:
     try:
-        loop_seconds = int(os.getenv("HISTORY_LOOP_SECONDS", "90"))
+        loop_seconds = int(os.getenv("HISTORY_LOOP_SECONDS", "60"))
     except ValueError:
-        loop_seconds = 90
-
+        loop_seconds = 60
     loop_seconds = max(60, loop_seconds)
+
+    try:
+        batch_size = max(1, min(3, int(os.getenv("HISTORY_BATCH_SIZE", "2"))))
+    except ValueError:
+        batch_size = 2
+
     logger.info(
-        "Historical ATH reconciliation started; one due call every %ss",
+        "Historical ATH reconciliation started; up to %s due calls every %ss",
+        batch_size,
         loop_seconds,
     )
 
-    # Let the bot and DB finish startup before the first history request.
     await asyncio.sleep(15)
 
     while True:
         try:
-            await reconcile_one_history(application)
+            for _ in range(batch_size):
+                await reconcile_one_history(application)
         except asyncio.CancelledError:
             raise
         except Exception:
