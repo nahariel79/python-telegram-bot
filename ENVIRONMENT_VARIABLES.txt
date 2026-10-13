@@ -19,3 +19,11 @@ Without COINGECKO_PRO_API_KEY the bot falls back to the keyless GeckoTerminal
 pool OHLCV API. It checks both the original call pool and the latest best pool.
 The keyless API has a low shared rate limit, so the history loop is intentionally
 throttled to one call reconciliation every 90 seconds by default.
+
+Stage 17 recurring testing notice / private support:
+- BETA_NOTICE_ENABLED=true        # optional; default true
+- BETA_NOTICE_HOURS=12            # optional; default 12, minimum 1
+
+Private support uses ADMIN_USER_ID as the destination for follower messages.
+The last notice publication time is stored in PostgreSQL, so deploys/restarts do
+not reset the schedule or create an immediate duplicate if a notice was sent recently.

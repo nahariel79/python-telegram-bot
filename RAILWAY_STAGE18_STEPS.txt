@@ -1,0 +1,27 @@
+Railway Stage 18 - quick setup
+
+A. Public dashboard domain
+1. Railway -> your project.
+2. Click the python-telegram-bot service (do NOT click Postgres).
+3. Open Settings.
+4. Find Networking / Public Networking.
+5. Click Generate Domain.
+6. Wait for Railway to show the generated https domain.
+7. Redeploy or Restart the bot once.
+
+B. Variables (python-telegram-bot -> Variables)
+ADMIN_USER_ID=<your numeric Telegram ID>
+DASHBOARD_REFRESH_SECONDS=15
+BETA_NOTICE_HOURS=12
+
+You normally do NOT need to create RAILWAY_PUBLIC_DOMAIN yourself; Railway provides it after Generate Domain.
+If needed, you may instead create:
+DASHBOARD_BASE_URL=https://your-generated-domain
+
+C. Delete a wrong coin safely
+Send privately to the bot:
+/deletecall PENIS
+or preferably:
+/deletecall <full CA>
+
+Confirm with the red/green confirmation buttons. The row disappears from the database and live dashboard within seconds.
