@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import urllib.request
+from urllib.parse import urlparse
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -29,7 +30,7 @@ from telegram.ext import (
     filters,
 )
 
-from bot import cache, db, stats
+from bot import cache, db, stats, webapp
 
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,11 @@ BOT_COMMANDS = (
     ("ping", "Check bot status"),
     ("myid", "Show your Telegram user ID"),
     ("channeltest", "Test publishing to the channel"),
+    ("broadcast", "פרסום הודעה חופשית בערוץ"),
+    ("cancelbroadcast", "ביטול טיוטת שידור"),
+    ("support", "שליחת הודעה פרטית לצוות הערוץ"),
+    ("bug", "דיווח על תקלה"),
+    ("deletecall", "מחיקת המלצה שגויה - מנהל בלבד"),
 )
 
 MENU_HELP = "Help"
@@ -64,6 +70,11 @@ HELP_TEXT = """הבוט פעיל.
 פקודות:
 /start - הפעלת הבוט
 /channeltest - בדיקת פרסום לערוץ
+/broadcast - יצירת הודעה חופשית לערוץ (מנהל בלבד)
+/cancelbroadcast - ביטול טיוטת שידור
+/support - פנייה פרטית לצוות הערוץ
+/bug - דיווח על תקלה
+/deletecall <CA/סימול> - מחיקת המלצה שגויה (מנהל בלבד)
 /myid - הצגת Telegram User ID
 /ping - בדיקת סטטוס
 """
@@ -72,6 +83,11 @@ SOLANA_CA_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
 
 LIST_ITEMS_PER_MESSAGE = 20
+
+BROADCAST_STATE_KEY = "broadcast_draft"
+BROADCAST_MAX_LINK_BUTTONS = 6
+SUPPORT_MODE_KEY = "support_mode"
+SUPPORT_REPLY_TO_KEY = "support_reply_to"
 
 
 def _bot_deep_link(username: str, payload: str) -> str:
@@ -83,22 +99,14 @@ def _lists_keyboard(bot_username: str, dex_url: str | None = None) -> InlineKeyb
     if dex_url:
         rows.append([InlineKeyboardButton("📈 DexScreener", url=dex_url)])
 
+    day = webapp.dashboard_url("day") or _bot_deep_link(bot_username, "calls_day")
+    month = webapp.dashboard_url("month") or _bot_deep_link(bot_username, "calls_month")
+    all_time = webapp.dashboard_url("all") or _bot_deep_link(bot_username, "calls_all")
     rows.append([
-        InlineKeyboardButton(
-            "📋 יומי",
-            url=_bot_deep_link(bot_username, "calls_day"),
-        ),
-        InlineKeyboardButton(
-            "🗓 חודשי",
-            url=_bot_deep_link(bot_username, "calls_month"),
-        ),
+        InlineKeyboardButton("🏆 מובילים יומיים", url=day),
+        InlineKeyboardButton("🗓 מובילים חודשיים", url=month),
     ])
-    rows.append([
-        InlineKeyboardButton(
-            "🏆 כל הזמנים",
-            url=_bot_deep_link(bot_username, "calls_all"),
-        )
-    ])
+    rows.append([InlineKeyboardButton("🌟 כל הזמנים", url=all_time)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -446,6 +454,597 @@ async def _send_calls_csv(
     )
 
 
+
+def _support_admin_id() -> int | None:
+    configured = os.getenv("ADMIN_USER_ID", "").strip()
+    if not configured:
+        return None
+    try:
+        return int(configured)
+    except ValueError:
+        logger.warning("ADMIN_USER_ID is not a valid integer.")
+        return None
+
+
+def _support_kind_label(mode: str) -> str:
+    return "🐞 דיווח על תקלה" if mode == "bug" else "💬 שאלה / פנייה פרטית"
+
+
+async def _begin_support(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    mode: str,
+) -> None:
+    if _support_admin_id() is None:
+        await message.reply_text(
+            "❌ מערכת הפניות עדיין לא הוגדרה. נסו שוב מאוחר יותר."
+        )
+        return
+
+    context.user_data[SUPPORT_MODE_KEY] = mode
+    if mode == "bug":
+        text = (
+            "🐞 <b>דיווח על תקלה</b>\n\n"
+            "שלחו עכשיו הודעה עם תיאור התקלה. אפשר לצרף גם צילום מסך.\n"
+            "כדאי לציין מה לחצתם ומה ציפיתם לראות."
+        )
+    else:
+        text = (
+            "💬 <b>פנייה פרטית לצוות הערוץ</b>\n\n"
+            "שלחו עכשיו את השאלה או ההודעה שלכם. אפשר לצרף גם צילום מסך.\n"
+            "הפנייה תועבר למנהל הערוץ באופן פרטי."
+        )
+    await message.reply_text(text, parse_mode="HTML")
+
+
+async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None or message.chat.type != "private":
+        return
+    await _begin_support(message, context, mode="support")
+
+
+async def bug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None or message.chat.type != "private":
+        return
+    await _begin_support(message, context, mode="bug")
+
+
+async def _relay_support_message(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = message.from_user
+    if user is None:
+        return
+    admin_id = _support_admin_id()
+    if admin_id is None:
+        await message.reply_text("❌ מערכת הפניות אינה זמינה כרגע.")
+        return
+
+    mode = context.user_data.pop(SUPPORT_MODE_KEY, "support")
+    username = f"@{user.username}" if user.username else "ללא username"
+    name = html.escape(user.full_name or user.first_name or "משתמש")
+    label = _support_kind_label(mode)
+    info = await context.bot.send_message(
+        chat_id=admin_id,
+        text=(
+            f"{label}\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"👤 <b>{name}</b> • {html.escape(username)}\n"
+            f"🆔 <code>{user.id}</code>\n\n"
+            "ההודעה עצמה מופיעה מיד מתחת."
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+            "✉️ השב בפרטי",
+            callback_data=f"support_reply:{user.id}",
+        )]]),
+    )
+    try:
+        await context.bot.copy_message(
+            chat_id=admin_id,
+            from_chat_id=message.chat_id,
+            message_id=message.message_id,
+        )
+    except Exception:
+        logger.exception("Could not copy support message to admin")
+        try:
+            await context.bot.edit_message_text(
+                chat_id=admin_id,
+                message_id=info.message_id,
+                text=f"{label}\n\n⚠️ לא הצלחתי להעתיק את תוכן הפנייה.",
+            )
+        except Exception:
+            pass
+        await message.reply_text("❌ הייתה תקלה בשליחת הפנייה. נסו שוב.")
+        return
+
+    await message.reply_text(
+        "✅ ההודעה נשלחה לצוות הערוץ.\n"
+        "אם תתקבל תשובה, היא תגיע אליכם כאן בשיחה הפרטית עם הבוט."
+    )
+
+
+async def support_reply_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+    await query.answer()
+
+    admin_id = _support_admin_id()
+    if admin_id is None or user.id != admin_id:
+        await query.answer("אין הרשאה", show_alert=True)
+        return
+
+    try:
+        target_user_id = int((query.data or "").split(":", 1)[1])
+    except (ValueError, IndexError):
+        return
+
+    context.user_data[SUPPORT_REPLY_TO_KEY] = target_user_id
+    await context.bot.send_message(
+        chat_id=admin_id,
+        text=(
+            f"✉️ שלח עכשיו תשובה למשתמש <code>{target_user_id}</code>.\n"
+            "ההודעה הבאה שתשלח לבוט תועבר אליו בפרטי."
+        ),
+        parse_mode="HTML",
+    )
+
+
+async def _send_support_reply(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    target_user_id = context.user_data.pop(SUPPORT_REPLY_TO_KEY, None)
+    if not target_user_id:
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text="💬 <b>תשובה מצוות הערוץ:</b>",
+            parse_mode="HTML",
+        )
+        await context.bot.copy_message(
+            chat_id=target_user_id,
+            from_chat_id=message.chat_id,
+            message_id=message.message_id,
+        )
+        await message.reply_text("✅ התשובה נשלחה בפרטי.")
+    except Exception as exc:
+        logger.exception("Could not send support reply")
+        await message.reply_text(f"❌ לא הצלחתי לשלוח את התשובה: {exc}")
+
+
+async def private_photo_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None or message.chat.type != "private":
+        return
+
+    draft = context.user_data.get(BROADCAST_STATE_KEY)
+    if draft and draft.get("mode") == "awaiting_content":
+        if not _broadcast_admin_allowed(user.id):
+            context.user_data.pop(BROADCAST_STATE_KEY, None)
+            await message.reply_text("⛔ אין לך הרשאה לשדר הודעות לערוץ.")
+            return
+        await _capture_broadcast_content(message, context)
+        return
+
+    admin_id = _support_admin_id()
+    if admin_id is not None and user.id == admin_id and context.user_data.get(SUPPORT_REPLY_TO_KEY):
+        await _send_support_reply(message, context)
+        return
+
+    if context.user_data.get(SUPPORT_MODE_KEY):
+        await _relay_support_message(message, context)
+        return
+
+def _broadcast_admin_allowed(user_id: int) -> bool:
+    """Broadcasts are intentionally stricter than call publishing.
+
+    ADMIN_USER_ID must be configured so no follower can ever publish arbitrary
+    channel content if the bot is exposed publicly.
+    """
+    configured = os.getenv("ADMIN_USER_ID", "").strip()
+    if not configured:
+        return False
+    try:
+        return user_id == int(configured)
+    except ValueError:
+        logger.warning("ADMIN_USER_ID is not a valid integer.")
+        return False
+
+
+def _valid_broadcast_url(value: str) -> bool:
+    value = value.strip()
+    if value.startswith("tg://"):
+        return True
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _broadcast_public_keyboard(draft: dict) -> InlineKeyboardMarkup | None:
+    buttons = draft.get("buttons") or []
+    if not buttons:
+        return None
+
+    rows = []
+    for index in range(0, len(buttons), 2):
+        rows.append([
+            InlineKeyboardButton(item["label"], url=item["url"])
+            for item in buttons[index:index + 2]
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _broadcast_preview_keyboard(draft: dict) -> InlineKeyboardMarkup:
+    rows = []
+    buttons = draft.get("buttons") or []
+    for index in range(0, len(buttons), 2):
+        rows.append([
+            InlineKeyboardButton(item["label"], url=item["url"])
+            for item in buttons[index:index + 2]
+        ])
+
+    if len(buttons) < BROADCAST_MAX_LINK_BUTTONS:
+        rows.append([
+            InlineKeyboardButton("➕ הוסף כפתור קישור", callback_data="broadcast_add_button")
+        ])
+
+    rows.append([
+        InlineKeyboardButton("✅ פרסם בערוץ", callback_data="broadcast_publish"),
+        InlineKeyboardButton("📌 פרסם והצמד", callback_data="broadcast_publish_pin"),
+    ])
+    rows.append([
+        InlineKeyboardButton("✏️ החלף תוכן", callback_data="broadcast_replace"),
+        InlineKeyboardButton("❌ ביטול", callback_data="broadcast_cancel"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _capture_broadcast_content(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    draft = context.user_data.get(BROADCAST_STATE_KEY) or {}
+    old_preview_id = draft.get("preview_message_id")
+    buttons = list(draft.get("buttons") or [])
+
+    if old_preview_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=message.chat_id,
+                message_id=old_preview_id,
+            )
+        except Exception:
+            logger.debug("Could not remove old broadcast preview", exc_info=True)
+
+    draft = {
+        "mode": "preview",
+        "source_chat_id": message.chat_id,
+        "source_message_id": message.message_id,
+        "buttons": buttons,
+    }
+
+    preview = await context.bot.copy_message(
+        chat_id=message.chat_id,
+        from_chat_id=message.chat_id,
+        message_id=message.message_id,
+        reply_markup=_broadcast_preview_keyboard(draft),
+    )
+    draft["preview_message_id"] = preview.message_id
+    context.user_data[BROADCAST_STATE_KEY] = draft
+
+    await message.reply_text(
+        "👆 זו התצוגה המקדימה.\n"
+        "העיצוב, הקישורים וההדגשות שהוספת בטלגרם נשמרים.\n"
+        "אפשר להוסיף כפתור קישור, לפרסם, להצמיד, להחליף תוכן או לבטל."
+    )
+
+
+async def _capture_broadcast_button_spec(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+) -> None:
+    draft = context.user_data.get(BROADCAST_STATE_KEY)
+    if not draft:
+        return
+
+    if "|" not in text:
+        await message.reply_text(
+            "שלח כך בדיוק:\n"
+            "שם הכפתור | https://example.com\n\n"
+            "לדוגמה:\n📈 לאתר | https://example.com"
+        )
+        return
+
+    label, url = (part.strip() for part in text.split("|", 1))
+    if not label or len(label) > 64:
+        await message.reply_text("❌ שם הכפתור חייב להכיל 1–64 תווים.")
+        return
+    if not _valid_broadcast_url(url):
+        await message.reply_text("❌ הקישור אינו תקין. השתמש ב-http://, https:// או tg://")
+        return
+
+    buttons = list(draft.get("buttons") or [])
+    if len(buttons) >= BROADCAST_MAX_LINK_BUTTONS:
+        draft["mode"] = "preview"
+        await message.reply_text("הגעת למספר הכפתורים המרבי להודעה.")
+        return
+
+    buttons.append({"label": label, "url": url})
+    draft["buttons"] = buttons
+    draft["mode"] = "preview"
+    context.user_data[BROADCAST_STATE_KEY] = draft
+
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=message.chat_id,
+            message_id=draft["preview_message_id"],
+            reply_markup=_broadcast_preview_keyboard(draft),
+        )
+    except Exception:
+        logger.exception("Could not refresh broadcast preview keyboard")
+
+    await message.reply_text("✅ הכפתור נוסף לתצוגה המקדימה.")
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+
+    if message.chat.type != "private":
+        await message.reply_text("את פקודת השידור מפעילים בשיחה פרטית עם הבוט.")
+        return
+
+    if not _broadcast_admin_allowed(user.id):
+        configured = os.getenv("ADMIN_USER_ID", "").strip()
+        if not configured:
+            await message.reply_text(
+                "🔒 שידור חופשי נעול עד להגדרת ADMIN_USER_ID ב-Railway.\n\n"
+                "שלח /myid, העתק את המספר, והוסף אותו ב-Railway כמשתנה ADMIN_USER_ID."
+            )
+        else:
+            await message.reply_text("⛔ אין לך הרשאה לשדר הודעות לערוץ.")
+        return
+
+    context.user_data[BROADCAST_STATE_KEY] = {
+        "mode": "awaiting_content",
+        "buttons": [],
+    }
+    await message.reply_text(
+        "📣 מצב שידור הופעל.\n\n"
+        "שלח עכשיו את ההודעה בדיוק כפי שתרצה שתופיע בערוץ.\n"
+        "אפשר לשלוח:\n"
+        "• טקסט חופשי עם Bold / Italic / קישורים / אימוג׳ים\n"
+        "• תמונה עם כיתוב\n\n"
+        "אחרי השליחה אראה לך תצוגה מקדימה לפני פרסום."
+    )
+
+
+async def cancel_broadcast_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+    if not _broadcast_admin_allowed(user.id):
+        await message.reply_text("⛔ אין לך הרשאה.")
+        return
+
+    draft = context.user_data.pop(BROADCAST_STATE_KEY, None)
+    if draft and draft.get("preview_message_id"):
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=message.chat_id,
+                message_id=draft["preview_message_id"],
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+    await message.reply_text("❌ טיוטת השידור בוטלה.")
+
+
+async def broadcast_media_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+
+    draft = context.user_data.get(BROADCAST_STATE_KEY)
+    if not draft or draft.get("mode") != "awaiting_content":
+        return
+    if not _broadcast_admin_allowed(user.id):
+        context.user_data.pop(BROADCAST_STATE_KEY, None)
+        await message.reply_text("⛔ אין לך הרשאה לשדר הודעות לערוץ.")
+        return
+
+    await _capture_broadcast_content(message, context)
+
+
+async def broadcast_add_button_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+    await query.answer()
+
+    if not _broadcast_admin_allowed(user.id):
+        await context.bot.send_message(chat_id=user.id, text="⛔ אין לך הרשאה.")
+        return
+
+    draft = context.user_data.get(BROADCAST_STATE_KEY)
+    if not draft:
+        await context.bot.send_message(chat_id=user.id, text="❌ הטיוטה כבר לא זמינה.")
+        return
+
+    if len(draft.get("buttons") or []) >= BROADCAST_MAX_LINK_BUTTONS:
+        await context.bot.send_message(chat_id=user.id, text="הגעת למספר הכפתורים המרבי.")
+        return
+
+    draft["mode"] = "awaiting_button"
+    context.user_data[BROADCAST_STATE_KEY] = draft
+    await context.bot.send_message(
+        chat_id=user.id,
+        text=(
+            "שלח את הכפתור בפורמט:\n"
+            "שם הכפתור | https://example.com\n\n"
+            "לדוגמה:\n📈 כניסה לאתר | https://example.com"
+        ),
+    )
+
+
+async def _publish_broadcast(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    pin: bool,
+) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+    await query.answer()
+
+    if not _broadcast_admin_allowed(user.id):
+        await context.bot.send_message(chat_id=user.id, text="⛔ אין לך הרשאה.")
+        return
+
+    draft = context.user_data.get(BROADCAST_STATE_KEY)
+    if not draft or not draft.get("source_message_id"):
+        await context.bot.send_message(chat_id=user.id, text="❌ הטיוטה כבר לא זמינה.")
+        return
+
+    target = _channel_target()
+    if target is None:
+        await context.bot.send_message(
+            chat_id=user.id,
+            text="❌ CHANNEL_ID לא מוגדר ב-Railway.",
+        )
+        return
+
+    try:
+        sent = await context.bot.copy_message(
+            chat_id=target,
+            from_chat_id=draft["source_chat_id"],
+            message_id=draft["source_message_id"],
+            reply_markup=_broadcast_public_keyboard(draft),
+        )
+    except Exception as exc:
+        logger.exception("Broadcast publication failed")
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=f"❌ לא הצלחתי לפרסם את ההודעה בערוץ.\nשגיאה: {exc}",
+        )
+        return
+
+    pin_warning = None
+    if pin:
+        try:
+            await context.bot.pin_chat_message(
+                chat_id=target,
+                message_id=sent.message_id,
+                disable_notification=True,
+            )
+        except Exception as exc:
+            logger.exception("Broadcast published but pinning failed")
+            pin_warning = str(exc)
+
+    context.user_data.pop(BROADCAST_STATE_KEY, None)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    result = "✅ ההודעה פורסמה בערוץ."
+    if pin and not pin_warning:
+        result += "\n📌 ההודעה גם הוצמדה."
+    elif pin_warning:
+        result += f"\n⚠️ הפרסום הצליח, אבל ההצמדה נכשלה: {pin_warning}"
+
+    await context.bot.send_message(chat_id=user.id, text=result)
+
+
+async def broadcast_publish_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    await _publish_broadcast(update, context, pin=False)
+
+
+async def broadcast_publish_pin_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    await _publish_broadcast(update, context, pin=True)
+
+
+async def broadcast_replace_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+    await query.answer()
+
+    if not _broadcast_admin_allowed(user.id):
+        await context.bot.send_message(chat_id=user.id, text="⛔ אין לך הרשאה.")
+        return
+
+    draft = context.user_data.get(BROADCAST_STATE_KEY)
+    if not draft:
+        return
+    draft["mode"] = "awaiting_content"
+    context.user_data[BROADCAST_STATE_KEY] = draft
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await context.bot.send_message(
+        chat_id=user.id,
+        text="✏️ שלח עכשיו את התוכן החדש. הכפתורים שכבר הוספת יישמרו.",
+    )
+
+
+async def broadcast_cancel_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+    await query.answer()
+
+    if not _broadcast_admin_allowed(user.id):
+        return
+
+    context.user_data.pop(BROADCAST_STATE_KEY, None)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await context.bot.send_message(chat_id=user.id, text="❌ טיוטת השידור בוטלה.")
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -468,6 +1067,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "export_month": "month",
         "export_all": "all",
     }
+
+    if payload in {"support", "bug"}:
+        await _begin_support(message, context, mode=payload)
+        return
 
     if payload in payload_to_period:
         await _send_calls_list(message, context, payload_to_period[payload])
@@ -569,6 +1172,32 @@ async def echo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     text = message.text.strip()
+
+    draft = context.user_data.get(BROADCAST_STATE_KEY)
+    if draft and draft.get("mode") == "awaiting_content":
+        if not _broadcast_admin_allowed(user.id):
+            context.user_data.pop(BROADCAST_STATE_KEY, None)
+            await message.reply_text("⛔ אין לך הרשאה לשדר הודעות לערוץ.")
+            return
+        await _capture_broadcast_content(message, context)
+        return
+
+    if draft and draft.get("mode") == "awaiting_button":
+        if not _broadcast_admin_allowed(user.id):
+            context.user_data.pop(BROADCAST_STATE_KEY, None)
+            await message.reply_text("⛔ אין לך הרשאה לשדר הודעות לערוץ.")
+            return
+        await _capture_broadcast_button_spec(message, context, text)
+        return
+
+    admin_id = _support_admin_id()
+    if admin_id is not None and user.id == admin_id and context.user_data.get(SUPPORT_REPLY_TO_KEY):
+        await _send_support_reply(message, context)
+        return
+
+    if context.user_data.get(SUPPORT_MODE_KEY):
+        await _relay_support_message(message, context)
+        return
 
     if text.lower() in {"test", "בדיקה"}:
         await channel_test(update, context)
@@ -804,6 +1433,128 @@ async def cancel_call_callback(
     await query.edit_message_text("❌ פרסום ההמלצה בוטל.")
 
 
+async def delete_call_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+    if not _broadcast_admin_allowed(user.id):
+        await message.reply_text("⛔ הפקודה זמינה למנהל בלבד. ודא ש-ADMIN_USER_ID מוגדר ב-Railway.")
+        return
+    if not context.args:
+        await message.reply_text(
+            "🗑 למחיקת המלצה שגויה שלח:\n"
+            "/deletecall CA\n\n"
+            "אפשר גם Call ID או סימול מדויק, למשל: /deletecall PENIS"
+        )
+        return
+    pool = context.bot_data.get(DB_KEY)
+    if pool is None:
+        await message.reply_text("❌ מסד הנתונים אינו זמין כרגע.")
+        return
+
+    term = " ".join(context.args).strip()
+    matches = await db.find_calls_for_admin_delete(pool, term)
+    if not matches:
+        await message.reply_text("לא נמצאה המלצה תואמת למחיקה.")
+        return
+    if len(matches) > 1:
+        lines = ["נמצאו כמה התאמות. השתמש ב-CA המלא או ב-Call ID:"]
+        for row in matches:
+            ca = str(row["token_address"])
+            lines.append(
+                f"• ID {row['id']} | ${row['symbol']} | {row['token_name']} | "
+                f"{ca[:6]}…{ca[-6:]}"
+            )
+        await message.reply_text("\n".join(lines))
+        return
+
+    row = matches[0]
+    entry = float(row["entry_valuation"] or 0.0)
+    ath = float(row["highest_valuation"] or entry)
+    profit = ((ath / entry) - 1.0) * 100.0 if entry > 0 else 0.0
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ כן, מחק הכל", callback_data=f"delete_call_confirm:{row['id']}"),
+        InlineKeyboardButton("❌ ביטול", callback_data="delete_call_cancel"),
+    ]])
+    await message.reply_text(
+        "🗑 <b>מחיקת המלצה</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🪙 <b>{html.escape(str(row['token_name']))} (${html.escape(str(row['symbol']))})</b>\n"
+        f"🆔 Call ID: <b>{row['id']}</b>\n"
+        f"🎯 MC/FDV בפרסום: <b>{_fmt_usd(entry)}</b>\n"
+        f"🏆 ATH שמור: <b>{_fmt_usd(ath)}</b>\n"
+        f"📈 רווח ATH: <b>{profit:+.1f}%</b>\n"
+        f"🕒 פורסם: {_format_call_time_israel(row['call_time'])}\n\n"
+        "המחיקה תסיר את ה-Call ואת יעדי הרווח שלו מה-DB ומהסטטיסטיקות. "
+        "הבוט גם ינסה למחוק את ההודעות המשויכות מהערוץ.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+async def delete_call_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+    await query.answer()
+    if not _broadcast_admin_allowed(user.id):
+        await query.edit_message_text("⛔ אין הרשאה למחיקה.")
+        return
+    try:
+        call_id = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError, AttributeError):
+        await query.edit_message_text("❌ מזהה Call לא תקין.")
+        return
+    pool = context.bot_data.get(DB_KEY)
+    if pool is None:
+        await query.edit_message_text("❌ מסד הנתונים אינו זמין כרגע.")
+        return
+
+    call, milestones = await db.get_call_delete_bundle(pool, call_id)
+    if call is None:
+        await query.edit_message_text("ה-Call כבר אינו קיים במסד הנתונים.")
+        return
+
+    chat_id = int(call["channel_chat_id"])
+    message_ids = []
+    if call["telegram_message_id"]:
+        message_ids.append(int(call["telegram_message_id"]))
+    message_ids.extend(
+        int(row["telegram_message_id"])
+        for row in milestones
+        if row["telegram_message_id"]
+    )
+
+    deleted = await db.delete_call_admin(pool, call_id)
+    removed_messages = 0
+    for message_id in sorted(set(message_ids)):
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            removed_messages += 1
+        except Exception:
+            logger.warning("Could not delete Telegram message %s for removed call %s", message_id, call_id)
+
+    if deleted:
+        await query.edit_message_text(
+            "✅ ההמלצה נמחקה מהמערכת.\n"
+            f"Call ID: {call_id}\n"
+            f"הודעות שנמחקו מהערוץ: {removed_messages}\n\n"
+            "ה-Dashboard יתעדכן אוטומטית בתוך כמה שניות."
+        )
+    else:
+        await query.edit_message_text("❌ לא הצלחתי למחוק את ה-Call.")
+
+
+async def delete_call_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
+    query = update.callback_query
+    if query is not None:
+        await query.answer()
+        await query.edit_message_text("❌ המחיקה בוטלה.")
+
+
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
     if update.effective_message is not None:
@@ -836,6 +1587,11 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("ping", ping))
     application.add_handler(CommandHandler("myid", myid))
     application.add_handler(CommandHandler("channeltest", channel_test))
+    application.add_handler(CommandHandler("broadcast", broadcast_command))
+    application.add_handler(CommandHandler("cancelbroadcast", cancel_broadcast_command))
+    application.add_handler(CommandHandler("support", support_command))
+    application.add_handler(CommandHandler("bug", bug_command))
+    application.add_handler(CommandHandler("deletecall", delete_call_command))
 
     application.add_handler(
         CallbackQueryHandler(publish_call_callback, pattern=r"^publish_call$")
@@ -843,12 +1599,41 @@ def register_handlers(application: Application) -> None:
     application.add_handler(
         CallbackQueryHandler(cancel_call_callback, pattern=r"^cancel_call$")
     )
+    application.add_handler(
+        CallbackQueryHandler(broadcast_add_button_callback, pattern=r"^broadcast_add_button$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(broadcast_publish_callback, pattern=r"^broadcast_publish$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            broadcast_publish_pin_callback, pattern=r"^broadcast_publish_pin$"
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(broadcast_replace_callback, pattern=r"^broadcast_replace$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(broadcast_cancel_callback, pattern=r"^broadcast_cancel$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(support_reply_callback, pattern=r"^support_reply:\d+$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(delete_call_confirm_callback, pattern=r"^delete_call_confirm:\d+$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(delete_call_cancel_callback, pattern=r"^delete_call_cancel$")
+    )
 
     application.add_handler(
         MessageHandler(
             filters.Regex(f"^({MENU_HELP}|{MENU_ABOUT}|{MENU_PING})$"),
             menu_button,
         )
+    )
+    application.add_handler(
+        MessageHandler(filters.PHOTO, private_photo_message)
     )
     application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     application.add_handler(

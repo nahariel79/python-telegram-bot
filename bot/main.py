@@ -6,7 +6,7 @@ import logging
 from telegram import Update
 from telegram.ext import Application, ApplicationBuilder
 
-from bot import cache, db, stats, tracker
+from bot import cache, db, notice, stats, tracker, webapp
 from bot.config import Settings
 from bot.handlers import (
     DB_KEY,
@@ -20,6 +20,8 @@ from bot.handlers import (
 logger = logging.getLogger(__name__)
 TRACKER_TASK_KEY = "tracker_task"
 STATS_TASK_KEY = "stats_task"
+NOTICE_TASK_KEY = "notice_task"
+DASHBOARD_TASK_KEY = "dashboard_task"
 
 
 def configure_logging(level_name: str) -> None:
@@ -60,9 +62,17 @@ def build_application(settings: Settings) -> Application:
             stats.stats_refresh_loop(application),
             name="channel-stats-refresh",
         )
+        application.bot_data[NOTICE_TASK_KEY] = asyncio.create_task(
+            notice.beta_notice_loop(application),
+            name="beta-channel-notice",
+        )
+        application.bot_data[DASHBOARD_TASK_KEY] = asyncio.create_task(
+            webapp.dashboard_snapshot_loop(application),
+            name="public-dashboard-snapshot",
+        )
 
     async def on_shutdown(application: Application) -> None:
-        for task_key in (TRACKER_TASK_KEY, STATS_TASK_KEY):
+        for task_key in (TRACKER_TASK_KEY, STATS_TASK_KEY, NOTICE_TASK_KEY, DASHBOARD_TASK_KEY):
             task = application.bot_data.get(task_key)
             if task is not None:
                 task.cancel()
@@ -94,6 +104,9 @@ def build_application(settings: Settings) -> Application:
 def main() -> None:
     settings = Settings.from_env()
     configure_logging(settings.log_level)
+
+    # Serve the public dashboard on Railway's PORT in a daemon thread.
+    webapp.start_http_server()
 
     application = build_application(settings)
     logger.info("Bot is running with polling.")

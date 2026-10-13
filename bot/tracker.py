@@ -205,22 +205,102 @@ def _extract_ohlcv(data: dict | list) -> list[list[float]]:
     return rows if isinstance(rows, list) else []
 
 
-def _ohlcv_high(rows: list[list[float]], min_timestamp: int) -> tuple[float | None, int | None]:
-    best_price = None
-    best_ts = None
+def _ohlcv_high(
+    rows: list[list[float]],
+    min_timestamp: int,
+    *,
+    expected_start_price: float | None = None,
+) -> tuple[float | None, int | None]:
+    """Return a validated OHLCV high and reject obvious bad-candle scaling.
+
+    Pool OHLCV can occasionally contain a wrong token side or a malformed wick.
+    A single such candle used to turn a ~$1M ATH into ~$1B.  We validate the
+    first available candle against the known call price and suppress only
+    extreme wick outliers; normal memecoin volatility is intentionally allowed.
+    """
+    parsed: list[tuple[int, float | None, float, float | None, float | None]] = []
     for row in rows:
         if not isinstance(row, list) or len(row) < 3:
             continue
         try:
             ts = int(row[0])
+            open_price = float(row[1]) if len(row) > 1 and row[1] is not None else None
             high = float(row[2])
+            low = float(row[3]) if len(row) > 3 and row[3] is not None else None
+            close = float(row[4]) if len(row) > 4 and row[4] is not None else None
         except (TypeError, ValueError):
             continue
         if ts < min_timestamp or high <= 0:
             continue
-        if best_price is None or high > best_price:
-            best_price = high
+        parsed.append((ts, open_price, high, low, close))
+
+    if not parsed:
+        return None, None
+
+    parsed.sort(key=lambda item: item[0])
+
+    # The candle nearest the call should be on roughly the same price scale as
+    # the price saved at publication.  A 1000x mismatch is a data-side error,
+    # not a believable move at the exact moment of the call.
+    if expected_start_price is not None and expected_start_price > 0:
+        anchor = parsed[0]
+        anchor_values = [
+            value for value in (anchor[1], anchor[4], anchor[3])
+            if value is not None and value > 0
+        ]
+        if anchor_values:
+            anchor_price = sorted(anchor_values)[len(anchor_values) // 2]
+            scale_ratio = max(
+                anchor_price / expected_start_price,
+                expected_start_price / anchor_price,
+            )
+            try:
+                max_anchor_factor = max(10.0, float(os.getenv(
+                    "HISTORY_MAX_ANCHOR_FACTOR", "500"
+                )))
+            except ValueError:
+                max_anchor_factor = 500.0
+            if scale_ratio > max_anchor_factor:
+                logger.warning(
+                    "Rejecting OHLCV series: start-price scale mismatch %.1fx "
+                    "(history=%s entry=%s)",
+                    scale_ratio, anchor_price, expected_start_price,
+                )
+                return None, None
+
+    try:
+        max_wick_factor = max(10.0, float(os.getenv(
+            "HISTORY_MAX_WICK_FACTOR", "100"
+        )))
+    except ValueError:
+        max_wick_factor = 100.0
+
+    best_price = None
+    best_ts = None
+    for ts, open_price, high, low, close in parsed:
+        body_values = [
+            value for value in (open_price, close, low)
+            if value is not None and value > 0
+        ]
+        candidate = high
+        if body_values:
+            body_reference = max(body_values)
+            # Keep legitimate wicks, but never let an isolated 100x+ malformed
+            # wick define the public ATH.  Use the candle body instead.
+            if high / body_reference > max_wick_factor:
+                logger.warning(
+                    "Ignoring extreme OHLCV wick %.1fx at %s",
+                    high / body_reference, ts,
+                )
+                candidate = max(
+                    value for value in (open_price, close)
+                    if value is not None and value > 0
+                )
+
+        if candidate > 0 and (best_price is None or candidate > best_price):
+            best_price = candidate
             best_ts = ts
+
     return best_price, best_ts
 
 
@@ -309,6 +389,7 @@ async def _fetch_history_window(
     start: datetime,
     end: datetime,
     pro_api_key: str | None,
+    expected_start_price: float | None = None,
 ) -> tuple[float | None, datetime | None]:
     """Get the maximum OHLCV high from start to end.
 
@@ -346,7 +427,11 @@ async def _fetch_history_window(
         limit=1000,
         pro_api_key=pro_api_key,
     )
-    price, ts = _ohlcv_high(minute_rows, start_ts)
+    price, ts = _ohlcv_high(
+        minute_rows,
+        start_ts,
+        expected_start_price=expected_start_price,
+    )
     consider(price, ts)
 
     # For older history, hourly OHLCV keeps the true intra-hour HIGH while
@@ -415,6 +500,7 @@ async def _historical_ath(call) -> tuple[float | None, datetime | None, str | No
                 start=call_time,
                 end=now,
                 pro_api_key=pro_key,
+                expected_start_price=entry_price,
             )
             if price is not None:
                 return price, observed_at, "coingecko_token_ohlcv"
@@ -445,6 +531,7 @@ async def _historical_ath(call) -> tuple[float | None, datetime | None, str | No
                 start=call_time,
                 end=now,
                 pro_api_key=None,
+                expected_start_price=entry_price,
             )
             successful_pool = True
             if price is not None and (best_price is None or price > best_price):

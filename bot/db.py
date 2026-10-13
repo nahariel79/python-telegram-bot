@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS calls (
     highest_valuation       DOUBLE PRECISION NOT NULL,
     highest_profit_percent  DOUBLE PRECISION NOT NULL DEFAULT 0,
     highest_milestone       INTEGER NOT NULL DEFAULT 0,
+    live_highest_valuation  DOUBLE PRECISION,
+    live_highest_profit_percent DOUBLE PRECISION,
+    live_ath_price          DOUBLE PRECISION,
     ath_price               DOUBLE PRECISION,
     ath_source              TEXT,
     ath_observed_at         TIMESTAMPTZ,
@@ -94,6 +97,15 @@ CREATE TABLE IF NOT EXISTS stats_pages (
     PRIMARY KEY (period, page_number)
 );
 """
+
+CREATE_SYSTEM_STATE_TABLE = """
+CREATE TABLE IF NOT EXISTS system_state (
+    key        TEXT PRIMARY KEY,
+    value_text TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
 
 CREATE_CALLS_ACTIVE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_calls_active ON calls(active) WHERE active = TRUE;
@@ -174,6 +186,60 @@ MIGRATIONS: list[tuple[str, str]] = [
         CHECK (period IN ('day', 'week', 'month', 'all'));
         """,
     ),
+    (
+        "2026_10_13_stage16_safe_historical_ath",
+        """
+        ALTER TABLE calls ADD COLUMN IF NOT EXISTS live_highest_valuation DOUBLE PRECISION;
+        ALTER TABLE calls ADD COLUMN IF NOT EXISTS live_highest_profit_percent DOUBLE PRECISION;
+        ALTER TABLE calls ADD COLUMN IF NOT EXISTS live_ath_price DOUBLE PRECISION;
+
+        -- Rebuild a clean live-only baseline from entry/current values and
+        -- milestones that were actually observed by the live DexScreener tracker.
+        UPDATE calls c
+        SET live_highest_valuation = GREATEST(
+                c.entry_valuation,
+                COALESCE(c.current_valuation, c.entry_valuation),
+                COALESCE((
+                    SELECT MAX(m.observed_valuation)
+                    FROM milestones m
+                    WHERE m.call_id = c.id AND m.source = 'live'
+                ), c.entry_valuation)
+            ),
+            live_ath_price = GREATEST(
+                COALESCE(c.entry_price, 0),
+                COALESCE(c.current_price, 0),
+                COALESCE((
+                    SELECT MAX(m.observed_price)
+                    FROM milestones m
+                    WHERE m.call_id = c.id AND m.source = 'live'
+                ), 0)
+            );
+
+        UPDATE calls
+        SET live_highest_profit_percent = CASE
+                WHEN entry_valuation > 0 THEN
+                    ((live_highest_valuation / entry_valuation) - 1.0) * 100.0
+                ELSE 0
+            END;
+
+        -- Remove any previously contaminated history-derived ATH from the
+        -- public ranking immediately. Historical reconciliation will rebuild it
+        -- with the stricter validation introduced in Stage 16.
+        UPDATE calls c
+        SET highest_valuation = COALESCE(c.live_highest_valuation, c.entry_valuation),
+            highest_profit_percent = COALESCE(c.live_highest_profit_percent, 0),
+            ath_price = COALESCE(NULLIF(c.live_ath_price, 0), c.entry_price),
+            ath_source = 'stage16_live_baseline',
+            ath_observed_at = NULL,
+            history_checked_at = NULL,
+            history_error = NULL,
+            highest_milestone = COALESCE((
+                SELECT MAX(m.milestone)
+                FROM milestones m
+                WHERE m.call_id = c.id AND m.source = 'live'
+            ), 0);
+        """,
+    ),
 ]
 
 UPSERT_USER = """
@@ -220,6 +286,7 @@ async def create_pool(dsn: str) -> asyncpg.Pool:
         await conn.execute(CREATE_CALLS_TABLE)
         await conn.execute(CREATE_MILESTONES_TABLE)
         await conn.execute(CREATE_STATS_PAGES_TABLE)
+        await conn.execute(CREATE_SYSTEM_STATE_TABLE)
         await _apply_migrations(conn)
         await conn.execute(CREATE_CALLS_ACTIVE_INDEX)
         await conn.execute(CREATE_HISTORY_DUE_INDEX)
@@ -264,12 +331,13 @@ async def insert_call(
             INSERT INTO calls (
                 token_address, token_name, symbol, pair_address, dexscreener_url,
                 valuation_type, entry_price, entry_valuation, current_price,
-                current_valuation, highest_valuation, ath_price, ath_source,
+                current_valuation, highest_valuation, live_highest_valuation,
+                live_highest_profit_percent, live_ath_price, ath_price, ath_source,
                 current_pair_address, current_dexscreener_url, last_pair_refresh_at,
                 channel_chat_id, telegram_message_id
             )
             VALUES (
-                $1,$2,$3,$4,$5,$6,$7,$8,$7,$8,$8,$7,'entry',$4,$5,now(),$9,$10
+                $1,$2,$3,$4,$5,$6,$7,$8,$7,$8,$8,$8,0,$7,$7,'entry',$4,$5,now(),$9,$10
             )
             RETURNING id;
             """,
@@ -338,6 +406,15 @@ async def update_call_snapshot(
         UPDATE calls
         SET current_price = $2,
             current_valuation = $3,
+            live_highest_valuation = GREATEST(
+                COALESCE(live_highest_valuation, entry_valuation), $4
+            ),
+            live_highest_profit_percent = GREATEST(
+                COALESCE(live_highest_profit_percent, 0), $5
+            ),
+            live_ath_price = GREATEST(
+                COALESCE(live_ath_price, entry_price, 0), COALESCE($2, 0)
+            ),
             highest_valuation = GREATEST(highest_valuation, $4),
             highest_profit_percent = GREATEST(highest_profit_percent, $5),
             last_checked_at = now()
@@ -391,20 +468,15 @@ async def update_call_history(
     await pool.execute(
         """
         UPDATE calls
-        SET ath_price = CASE
-                WHEN ath_price IS NULL OR $2 > ath_price THEN $2
-                ELSE ath_price
-            END,
-            ath_source = CASE
-                WHEN ath_price IS NULL OR $2 > ath_price THEN $5
-                ELSE ath_source
-            END,
-            ath_observed_at = CASE
-                WHEN ath_price IS NULL OR $2 > ath_price THEN $6
-                ELSE ath_observed_at
-            END,
-            highest_valuation = GREATEST(highest_valuation, $3),
-            highest_profit_percent = GREATEST(highest_profit_percent, $4),
+        SET ath_price = $2,
+            ath_source = $5,
+            ath_observed_at = $6,
+            highest_valuation = GREATEST(
+                COALESCE(live_highest_valuation, entry_valuation), $3
+            ),
+            highest_profit_percent = GREATEST(
+                COALESCE(live_highest_profit_percent, 0), $4
+            ),
             history_checked_at = now(),
             history_error = NULL
         WHERE id = $1;
@@ -779,6 +851,83 @@ async def get_posts_for_keyboard_repair(pool: asyncpg.Pool) -> list[asyncpg.Reco
             """
         )
     )
+
+
+
+async def get_system_state(pool: asyncpg.Pool, key: str) -> str | None:
+    return await pool.fetchval(
+        "SELECT value_text FROM system_state WHERE key = $1;",
+        key,
+    )
+
+
+async def set_system_state(pool: asyncpg.Pool, key: str, value: str) -> None:
+    await pool.execute(
+        """
+        INSERT INTO system_state(key, value_text, updated_at)
+        VALUES ($1, $2, now())
+        ON CONFLICT (key) DO UPDATE
+        SET value_text = EXCLUDED.value_text, updated_at = now();
+        """,
+        key, value,
+    )
+
+
+async def find_calls_for_admin_delete(pool: asyncpg.Pool, term: str) -> list[asyncpg.Record]:
+    """Find a call by exact CA, exact symbol, call ID, or exact token name."""
+    clean = term.strip()
+    symbol = clean.lstrip("$")
+    return list(
+        await pool.fetch(
+            """
+            SELECT id, token_address, token_name, symbol, valuation_type,
+                   entry_valuation, highest_valuation, highest_profit_percent,
+                   call_time, channel_chat_id, telegram_message_id,
+                   COALESCE(current_dexscreener_url, dexscreener_url) AS dexscreener_url
+            FROM calls
+            WHERE lower(token_address) = lower($1)
+               OR lower(symbol) = lower($2)
+               OR lower(token_name) = lower($1)
+               OR id::text = $1
+            ORDER BY call_time DESC
+            LIMIT 10;
+            """,
+            clean,
+            symbol,
+        )
+    )
+
+
+async def get_call_delete_bundle(pool: asyncpg.Pool, call_id: int) -> tuple[asyncpg.Record | None, list[asyncpg.Record]]:
+    call = await pool.fetchrow(
+        """
+        SELECT id, token_address, token_name, symbol, valuation_type,
+               entry_valuation, highest_valuation, highest_profit_percent,
+               call_time, channel_chat_id, telegram_message_id
+        FROM calls WHERE id=$1;
+        """,
+        call_id,
+    )
+    if call is None:
+        return None, []
+    milestones = list(
+        await pool.fetch(
+            """
+            SELECT milestone, telegram_message_id
+            FROM milestones
+            WHERE call_id=$1 AND telegram_message_id IS NOT NULL
+            ORDER BY milestone;
+            """,
+            call_id,
+        )
+    )
+    return call, milestones
+
+
+async def delete_call_admin(pool: asyncpg.Pool, call_id: int) -> bool:
+    """Delete one call. Milestones are removed automatically by ON DELETE CASCADE."""
+    result = await pool.execute("DELETE FROM calls WHERE id=$1;", call_id)
+    return result.endswith("1")
 
 
 async def close_pool(pool: asyncpg.Pool) -> None:
