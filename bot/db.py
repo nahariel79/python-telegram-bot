@@ -534,6 +534,27 @@ async def get_momentum_reference_values(
     return one_minute, five_minutes
 
 
+async def get_previous_volume_snapshot(
+    pool: asyncpg.Pool,
+    *,
+    call_id: int,
+) -> asyncpg.Record | None:
+    # The tracker stores the current snapshot immediately before calling this
+    # helper, so OFFSET 1 returns the immediately preceding observation.
+    return await pool.fetchrow(
+        """
+        SELECT price, valuation, volume_m5_usd, observed_at
+        FROM price_snapshots
+        WHERE call_id = $1
+          AND volume_m5_usd IS NOT NULL
+        ORDER BY observed_at DESC
+        OFFSET 1
+        LIMIT 1;
+        """,
+        call_id,
+    )
+
+
 async def prune_price_snapshots(pool: asyncpg.Pool) -> None:
     await pool.execute(
         "DELETE FROM price_snapshots WHERE observed_at < now() - interval '30 minutes';"

@@ -745,7 +745,9 @@ def _momentum_message(
     *,
     current_valuation: float,
     current_profit: float,
+    previous_volume_m5_usd: float | None,
     volume_m5_usd: float,
+    volume_alert_threshold_usd: float,
     volume_change_1m: float | None,
     volume_change_5m: float | None,
 ) -> str:
@@ -754,17 +756,18 @@ def _momentum_message(
     symbol = html.escape(str(call["symbol"]))
     ath = max(float(call["highest_valuation"] or call["entry_valuation"]), current_valuation)
 
-    one = f"{volume_change_1m:+.1f}%" if volume_change_1m is not None else "לא זמין"
-    five = f"{volume_change_5m:+.1f}%" if volume_change_5m is not None else "לא זמין"
+    previous = _fmt_usd(previous_volume_m5_usd) if previous_volume_m5_usd is not None else "לא זמין"
+
+    threshold_label = _fmt_usd(volume_alert_threshold_usd)
 
     return (
-        "⚡📊 <b>זינוק חריג בווליום</b> 📊⚡\n"
+        f"⚡📊 <b>ווליום חצה את רף {threshold_label}</b> 📊⚡\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"🪙 <b>{name} (${symbol})</b>\n"
-        "🔥 <b>המטבע מראה סימנים לקפיצה</b>\n\n"
-        f"💥 <b>ווליום 5 דקות:</b> {_fmt_usd(volume_m5_usd)}\n"
-        f"⏱ <b>שינוי בווליום לעומת לפני ~1 דקה:</b> {one}\n"
-        f"⏱ <b>שינוי בווליום לעומת לפני ~5 דקות:</b> {five}\n\n"
+        f"🔥 <b>המטבע עבר מרמת ווליום נמוכה מ-{threshold_label} לרמה של {threshold_label} ומעלה</b>\n\n"
+        f"⬅️ <b>ווליום 5 דקות קודם:</b> {previous}\n"
+        f"➡️ <b>ווליום 5 דקות עכשיו:</b> {_fmt_usd(volume_m5_usd)}\n"
+        f"🎚 <b>רף ההתראה:</b> {_fmt_usd(volume_alert_threshold_usd)}\n\n"
         f"🎯 <b>{metric} בזמן ההמלצה:</b> {_fmt_usd(call['entry_valuation'])}\n"
         f"💰 <b>{metric} נוכחי:</b> {_fmt_usd(current_valuation)}\n"
         f"📈 <b>רווח/הפסד נוכחי:</b> {current_profit:+.1f}%\n"
@@ -783,15 +786,17 @@ async def _publish_momentum_alert(
     current_price: float | None,
     current_valuation: float,
     current_profit: float,
+    previous_volume_m5_usd: float | None,
     volume_m5_usd: float,
+    volume_alert_threshold_usd: float,
     volume_change_1m: float | None,
     volume_change_5m: float | None,
     dex_url: str | None,
 ) -> bool:
     try:
-        cooldown = max(5, int(os.getenv("MOMENTUM_COOLDOWN_MINUTES", "30")))
+        cooldown = max(0, int(os.getenv("MOMENTUM_COOLDOWN_MINUTES", "0")))
     except ValueError:
-        cooldown = 30
+        cooldown = 0
 
     alert_id = await db.claim_momentum_alert(
         pool,
@@ -826,7 +831,9 @@ async def _publish_momentum_alert(
                 call,
                 current_valuation=current_valuation,
                 current_profit=current_profit,
+                previous_volume_m5_usd=previous_volume_m5_usd,
                 volume_m5_usd=volume_m5_usd,
+                volume_alert_threshold_usd=volume_alert_threshold_usd,
                 volume_change_1m=volume_change_1m,
                 volume_change_5m=volume_change_5m,
             ),
@@ -939,24 +946,25 @@ async def check_calls_once(application: Application) -> None:
                 volume_change_5m = _percent_change(current_volume_m5, ref_volume(five_ref))
 
                 try:
-                    threshold_1m = float(os.getenv("VOLUME_SPIKE_1M_PERCENT", "50"))
+                    volume_alert_threshold = float(os.getenv("VOLUME_ALERT_THRESHOLD_USD", "10000"))
                 except ValueError:
-                    threshold_1m = 50.0
-                try:
-                    threshold_5m = float(os.getenv("VOLUME_SPIKE_5M_PERCENT", "100"))
-                except ValueError:
-                    threshold_5m = 100.0
-                try:
-                    min_volume_m5 = float(os.getenv("VOLUME_SPIKE_MIN_5M_USD", "1000"))
-                except ValueError:
-                    min_volume_m5 = 1000.0
+                    volume_alert_threshold = 10000.0
+
+                previous_ref = await db.get_previous_volume_snapshot(
+                    pool,
+                    call_id=int(call["id"]),
+                )
+                previous_volume_m5 = ref_volume(previous_ref)
 
                 milestone = int(profit // 100) * 100 if profit >= 100 else 0
                 has_new_milestone = milestone > int(call["highest_milestone"] or 0)
 
-                momentum_triggered = current_volume_m5 >= min_volume_m5 and (
-                    (volume_change_1m is not None and volume_change_1m >= threshold_1m)
-                    or (volume_change_5m is not None and volume_change_5m >= threshold_5m)
+                # Alert only on an upward crossing of the absolute 5-minute-volume threshold.
+                # Percent changes no longer participate in the trigger condition.
+                momentum_triggered = (
+                    previous_volume_m5 is not None
+                    and previous_volume_m5 < volume_alert_threshold
+                    and current_volume_m5 >= volume_alert_threshold
                 )
 
                 # Avoid two near-identical posts in the same cycle: if a new
@@ -969,7 +977,9 @@ async def check_calls_once(application: Application) -> None:
                         current_price=current_price,
                         current_valuation=current_valuation,
                         current_profit=profit,
+                        previous_volume_m5_usd=previous_volume_m5,
                         volume_m5_usd=current_volume_m5,
+                        volume_alert_threshold_usd=volume_alert_threshold,
                         volume_change_1m=volume_change_1m,
                         volume_change_5m=volume_change_5m,
                         dex_url=dex_url,
