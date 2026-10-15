@@ -27,3 +27,12 @@ Stage 17 recurring testing notice / private support:
 Private support uses ADMIN_USER_ID as the destination for follower messages.
 The last notice publication time is stored in PostgreSQL, so deploys/restarts do
 not reset the schedule or create an immediate duplicate if a notice was sent recently.
+
+
+# Stage 20 volume-spike tuning
+# Trigger is VOLUME acceleration, not price movement.
+VOLUME_SPIKE_1M_PERCENT=50
+VOLUME_SPIKE_5M_PERCENT=100
+VOLUME_SPIKE_MIN_5M_USD=1000
+MOMENTUM_COOLDOWN_MINUTES=30
+# TRACK_INTERVAL_SECONDS=30   # existing tracker cadence; 15-30s works well for 1-5m detection
