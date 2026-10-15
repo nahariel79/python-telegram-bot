@@ -1165,6 +1165,144 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await ping(update, context)
 
 
+def _original_call_url(row) -> str | None:
+    channel = os.getenv("CHANNEL_ID", "").strip()
+    message_id = row["telegram_message_id"] if row is not None else None
+    if channel.startswith("@") and message_id:
+        return f"https://t.me/{channel[1:]}/{int(message_id)}"
+    return None
+
+
+def _existing_call_buttons(row) -> InlineKeyboardMarkup:
+    rows = [[
+        InlineKeyboardButton(
+            "🚀 זמן טוב לכניסה לפני עלייה",
+            callback_data=f"repeat_signal_entry:{int(row['id'])}",
+        )
+    ], [
+        InlineKeyboardButton(
+            "➕ זמן טוב להוסיף צבירה",
+            callback_data=f"repeat_signal_accumulate:{int(row['id'])}",
+        )
+    ]]
+    dex_url = row["current_dexscreener_url"] or row["dexscreener_url"]
+    if dex_url:
+        rows.append([InlineKeyboardButton("📈 DexScreener", url=dex_url)])
+    return InlineKeyboardMarkup(rows)
+
+
+def _repeat_signal_message(row, signal_type: str, current_valuation: float) -> str:
+    entry = float(row["entry_valuation"])
+    profit = ((current_valuation / entry) - 1.0) * 100.0 if entry > 0 else 0.0
+    ath = float(row["highest_valuation"] or entry)
+    metric = "MC" if row["valuation_type"] == "marketCap" else "FDV"
+    name = html.escape(str(row["token_name"]))
+    symbol = html.escape(str(row["symbol"]))
+
+    if signal_type == "entry":
+        title = "🚀 <b>עדכון ל-Call קיים</b>"
+        action = "🟢 <b>זמן טוב לכניסה לפני עלייה אפשרית</b>"
+    else:
+        title = "➕ <b>עדכון צבירה ל-Call קיים</b>"
+        action = "🟣 <b>זמן טוב להוסיף עוד צבירה למטבע</b>"
+
+    return (
+        f"{title}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🪙 <b>{name} (${symbol})</b>\n"
+        f"{action}\n\n"
+        f"🎯 <b>{metric} בזמן ההמלצה:</b> {_fmt_usd(entry)}\n"
+        f"💰 <b>{metric} נוכחי:</b> {_fmt_usd(current_valuation)}\n"
+        f"📈 <b>מצב מאז ההמלצה:</b> {profit:+.1f}%\n"
+        f"🏆 <b>ATH מאז ההמלצה:</b> {_fmt_usd(ath)}\n"
+        f"🕒 <b>המלצה מקורית:</b> {_format_call_time_israel(row['call_time'])}\n\n"
+        "⚠️ <i>זהו עדכון כללי לערוץ ולא הבטחה להמשך עלייה. "
+        "Memecoins תנודתיים מאוד וכל החלטת מסחר היא באחריות המשתמש.</i>"
+    )
+
+
+async def repeat_signal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+    await query.answer()
+
+    if not _admin_allowed(user.id):
+        await query.edit_message_text("⛔ אין לך הרשאה לפרסם עדכון למטבע.")
+        return
+
+    try:
+        prefix, raw_id = (query.data or "").split(":", 1)
+        call_id = int(raw_id)
+    except Exception:
+        await query.edit_message_text("❌ לא הצלחתי לזהות את ה-Call.")
+        return
+
+    signal_type = "entry" if prefix == "repeat_signal_entry" else "accumulate"
+    pool = context.bot_data.get(DB_KEY)
+    if pool is None:
+        await query.edit_message_text("❌ מסד הנתונים אינו זמין כרגע.")
+        return
+
+    row = await db.get_call_by_id(pool, call_id)
+    if row is None:
+        await query.edit_message_text("❌ ההמלצה כבר אינה קיימת במערכת.")
+        return
+
+    current_valuation = float(row["current_valuation"] or row["entry_valuation"])
+    dex_url = row["current_dexscreener_url"] or row["dexscreener_url"]
+
+    try:
+        pair = await _fetch_best_pair(row["token_address"])
+        if pair:
+            fresh = _call_data_from_pair(row["token_address"], pair)
+            raw = pair.get(row["valuation_type"])
+            try:
+                fresh_valuation = float(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                fresh_valuation = None
+            if fresh_valuation and fresh_valuation > 0:
+                current_valuation = fresh_valuation
+            dex_url = fresh.get("dex_url") or dex_url
+    except Exception:
+        logger.exception("Could not refresh repeated-call signal data for call %s", call_id)
+
+    try:
+        keyboard = await stats.recommendation_keyboard(
+            context.application,
+            pool,
+            channel_chat_id=int(row["channel_chat_id"]),
+            dex_url=dex_url,
+        )
+        rows = [list(r) for r in keyboard.inline_keyboard]
+        original_url = _original_call_url(row)
+        if original_url:
+            rows.insert(1, [InlineKeyboardButton("🧾 להמלצה המקורית", url=original_url)])
+        keyboard = InlineKeyboardMarkup(rows)
+
+        sent = await context.bot.send_message(
+            chat_id=int(row["channel_chat_id"]),
+            text=_repeat_signal_message(row, signal_type, current_valuation),
+            parse_mode="HTML",
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+        await db.log_call_signal(
+            pool,
+            call_id=call_id,
+            signal_type=signal_type,
+            telegram_message_id=sent.message_id,
+        )
+    except Exception as exc:
+        logger.exception("Could not publish repeated-call signal")
+        await query.edit_message_text(f"❌ הפרסום נכשל: {exc}")
+        return
+
+    label = "זמן טוב לכניסה" if signal_type == "entry" else "הוספת צבירה"
+    await query.edit_message_text(f"✅ פורסם בערוץ עדכון: {label} עבור ${row['symbol']}.")
+
+
 async def echo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -1216,11 +1354,14 @@ async def echo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         existing = await db.get_existing_call(pool, text)
         if existing is not None:
             await message.reply_text(
-                "⛔ המטבע הזה כבר פורסם בעבר ולכן לא ניתן לפרסם אותו שוב.\n\n"
-                f"${existing['symbol']} | Call ID: {existing['id']}\n"
-                f"MC/FDV בפרסום: {_fmt_usd(existing['entry_valuation'])}\n"
-                f"ATH מאז הפרסום: {_fmt_usd(existing['highest_valuation'])}\n"
-                f"שיא: {float(existing['highest_profit_percent'] or 0):+.0f}%"
+                "♻️ המטבע הזה כבר פורסם בעבר. לא תיווצר המלצה חדשה ולא ישתנה מחיר הכניסה המקורי.\n\n"
+                f"🪙 ${existing['symbol']} | Call ID: {existing['id']}\n"
+                f"🎯 MC/FDV בפרסום: {_fmt_usd(existing['entry_valuation'])}\n"
+                f"🏆 ATH מאז הפרסום: {_fmt_usd(existing['highest_valuation'])}\n"
+                f"📈 שיא: {float(existing['highest_profit_percent'] or 0):+.0f}%\n\n"
+                "בחר איזה עדכון תרצה לפרסם לערוץ:",
+                reply_markup=_existing_call_buttons(existing),
+                disable_web_page_preview=True,
             )
             return
 
@@ -1598,6 +1739,12 @@ def register_handlers(application: Application) -> None:
     )
     application.add_handler(
         CallbackQueryHandler(cancel_call_callback, pattern=r"^cancel_call$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            repeat_signal_callback,
+            pattern=r"^repeat_signal_(entry|accumulate):\d+$",
+        )
     )
     application.add_handler(
         CallbackQueryHandler(broadcast_add_button_callback, pattern=r"^broadcast_add_button$")

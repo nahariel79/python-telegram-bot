@@ -240,6 +240,60 @@ MIGRATIONS: list[tuple[str, str]] = [
             ), 0);
         """,
     ),
+    (
+        "2026_10_15_stage19_momentum_and_repeat_signals",
+        """
+        CREATE TABLE IF NOT EXISTS price_snapshots (
+            id          BIGSERIAL PRIMARY KEY,
+            call_id     BIGINT NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
+            observed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            price       DOUBLE PRECISION,
+            valuation   DOUBLE PRECISION NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_price_snapshots_call_time
+        ON price_snapshots(call_id, observed_at DESC);
+
+        CREATE TABLE IF NOT EXISTS momentum_alerts (
+            id                      BIGSERIAL PRIMARY KEY,
+            call_id                 BIGINT NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
+            change_1m_percent       DOUBLE PRECISION,
+            change_5m_percent       DOUBLE PRECISION,
+            observed_price          DOUBLE PRECISION,
+            observed_valuation      DOUBLE PRECISION NOT NULL,
+            observed_profit_percent DOUBLE PRECISION NOT NULL,
+            observed_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+            telegram_message_id     BIGINT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_momentum_alerts_call_time
+        ON momentum_alerts(call_id, observed_at DESC);
+
+        CREATE TABLE IF NOT EXISTS call_signals (
+            id                  BIGSERIAL PRIMARY KEY,
+            call_id             BIGINT NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
+            signal_type         TEXT NOT NULL CHECK (signal_type IN ('entry', 'accumulate')),
+            telegram_message_id BIGINT,
+            created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        """,
+    ),
+    (
+        "2026_10_15_stage20_volume_momentum",
+        """
+        ALTER TABLE price_snapshots
+        ADD COLUMN IF NOT EXISTS volume_m5_usd DOUBLE PRECISION;
+
+        ALTER TABLE momentum_alerts
+        ADD COLUMN IF NOT EXISTS volume_m5_usd DOUBLE PRECISION;
+
+        ALTER TABLE momentum_alerts
+        ADD COLUMN IF NOT EXISTS volume_change_1m_percent DOUBLE PRECISION;
+
+        ALTER TABLE momentum_alerts
+        ADD COLUMN IF NOT EXISTS volume_change_5m_percent DOUBLE PRECISION;
+        """,
+    ),
 ]
 
 UPSERT_USER = """
@@ -426,6 +480,120 @@ async def update_call_snapshot(
         observed_high_valuation,
         observed_high_profit_percent,
     )
+
+
+async def record_price_snapshot(
+    pool: asyncpg.Pool,
+    *,
+    call_id: int,
+    price: float | None,
+    valuation: float,
+    volume_m5_usd: float | None,
+) -> None:
+    await pool.execute(
+        """
+        INSERT INTO price_snapshots(call_id, price, valuation, volume_m5_usd)
+        VALUES ($1, $2, $3, $4);
+        """,
+        call_id,
+        price,
+        valuation,
+        volume_m5_usd,
+    )
+
+
+async def get_momentum_reference_values(
+    pool: asyncpg.Pool,
+    *,
+    call_id: int,
+) -> tuple[asyncpg.Record | None, asyncpg.Record | None]:
+    one_minute = await pool.fetchrow(
+        """
+        SELECT price, valuation, volume_m5_usd, observed_at
+        FROM price_snapshots
+        WHERE call_id = $1
+          AND observed_at BETWEEN now() - interval '100 seconds'
+                              AND now() - interval '40 seconds'
+        ORDER BY ABS(EXTRACT(EPOCH FROM (observed_at - (now() - interval '60 seconds'))))
+        LIMIT 1;
+        """,
+        call_id,
+    )
+    five_minutes = await pool.fetchrow(
+        """
+        SELECT price, valuation, volume_m5_usd, observed_at
+        FROM price_snapshots
+        WHERE call_id = $1
+          AND observed_at BETWEEN now() - interval '390 seconds'
+                              AND now() - interval '240 seconds'
+        ORDER BY ABS(EXTRACT(EPOCH FROM (observed_at - (now() - interval '300 seconds'))))
+        LIMIT 1;
+        """,
+        call_id,
+    )
+    return one_minute, five_minutes
+
+
+async def prune_price_snapshots(pool: asyncpg.Pool) -> None:
+    await pool.execute(
+        "DELETE FROM price_snapshots WHERE observed_at < now() - interval '30 minutes';"
+    )
+
+
+async def claim_momentum_alert(
+    pool: asyncpg.Pool,
+    *,
+    call_id: int,
+    cooldown_minutes: int,
+    volume_change_1m_percent: float | None,
+    volume_change_5m_percent: float | None,
+    volume_m5_usd: float,
+    observed_price: float | None,
+    observed_valuation: float,
+    observed_profit_percent: float,
+) -> int | None:
+    value = await pool.fetchval(
+        """
+        INSERT INTO momentum_alerts(
+            call_id, volume_change_1m_percent, volume_change_5m_percent,
+            volume_m5_usd, observed_price, observed_valuation, observed_profit_percent
+        )
+        SELECT $1, $3, $4, $5, $6, $7, $8
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM momentum_alerts
+            WHERE call_id = $1
+              AND observed_at > now() - ($2 * interval '1 minute')
+        )
+        RETURNING id;
+        """,
+        call_id,
+        cooldown_minutes,
+        volume_change_1m_percent,
+        volume_change_5m_percent,
+        volume_m5_usd,
+        observed_price,
+        observed_valuation,
+        observed_profit_percent,
+    )
+    return int(value) if value is not None else None
+
+
+async def finalize_momentum_alert(
+    pool: asyncpg.Pool,
+    *,
+    alert_id: int,
+    telegram_message_id: int,
+) -> None:
+    await pool.execute(
+        "UPDATE momentum_alerts SET telegram_message_id = $2 WHERE id = $1;",
+        alert_id,
+        telegram_message_id,
+    )
+
+
+async def release_momentum_alert(pool: asyncpg.Pool, *, alert_id: int) -> None:
+    await pool.execute("DELETE FROM momentum_alerts WHERE id = $1;", alert_id)
 
 
 async def get_call_due_for_history(
@@ -656,14 +824,47 @@ async def get_existing_call(
 ) -> asyncpg.Record | None:
     return await pool.fetchrow(
         """
-        SELECT id, token_name, symbol, entry_valuation, highest_valuation,
-               highest_profit_percent, call_time, telegram_message_id
+        SELECT id, token_address, token_name, symbol, valuation_type,
+               entry_price, entry_valuation, current_price, current_valuation,
+               highest_valuation, highest_profit_percent, call_time,
+               pair_address, current_pair_address, dexscreener_url,
+               current_dexscreener_url, channel_chat_id, telegram_message_id
         FROM calls
         WHERE lower(token_address) = lower($1)
         ORDER BY call_time ASC
         LIMIT 1;
         """,
         token_address,
+    )
+
+
+async def get_call_by_id(pool: asyncpg.Pool, call_id: int) -> asyncpg.Record | None:
+    return await pool.fetchrow(
+        """
+        SELECT *
+        FROM calls
+        WHERE id = $1
+        LIMIT 1;
+        """,
+        call_id,
+    )
+
+
+async def log_call_signal(
+    pool: asyncpg.Pool,
+    *,
+    call_id: int,
+    signal_type: str,
+    telegram_message_id: int | None,
+) -> None:
+    await pool.execute(
+        """
+        INSERT INTO call_signals(call_id, signal_type, telegram_message_id)
+        VALUES ($1, $2, $3);
+        """,
+        call_id,
+        signal_type,
+        telegram_message_id,
     )
 
 

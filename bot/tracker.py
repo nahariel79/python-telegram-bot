@@ -9,6 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application
@@ -720,6 +721,132 @@ async def _publish_milestone(
     return True
 
 
+def _format_call_time_israel(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(ZoneInfo("Asia/Jerusalem")).strftime("%d/%m/%Y • %H:%M")
+
+
+def _original_call_url(call) -> str | None:
+    channel = os.getenv("CHANNEL_ID", "").strip()
+    if channel.startswith("@") and call["telegram_message_id"]:
+        return f"https://t.me/{channel[1:]}/{int(call['telegram_message_id'])}"
+    return None
+
+
+def _percent_change(current: float, previous: float | None) -> float | None:
+    if previous is None or previous <= 0:
+        return None
+    return ((current / previous) - 1.0) * 100.0
+
+
+def _momentum_message(
+    call,
+    *,
+    current_valuation: float,
+    current_profit: float,
+    volume_m5_usd: float,
+    volume_change_1m: float | None,
+    volume_change_5m: float | None,
+) -> str:
+    metric = "MC" if call["valuation_type"] == "marketCap" else "FDV"
+    name = html.escape(str(call["token_name"]))
+    symbol = html.escape(str(call["symbol"]))
+    ath = max(float(call["highest_valuation"] or call["entry_valuation"]), current_valuation)
+
+    one = f"{volume_change_1m:+.1f}%" if volume_change_1m is not None else "לא זמין"
+    five = f"{volume_change_5m:+.1f}%" if volume_change_5m is not None else "לא זמין"
+
+    return (
+        "⚡📊 <b>זינוק חריג בווליום</b> 📊⚡\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🪙 <b>{name} (${symbol})</b>\n"
+        "🔥 <b>המטבע מראה סימנים לקפיצה</b>\n\n"
+        f"💥 <b>ווליום 5 דקות:</b> {_fmt_usd(volume_m5_usd)}\n"
+        f"⏱ <b>שינוי בווליום לעומת לפני ~1 דקה:</b> {one}\n"
+        f"⏱ <b>שינוי בווליום לעומת לפני ~5 דקות:</b> {five}\n\n"
+        f"🎯 <b>{metric} בזמן ההמלצה:</b> {_fmt_usd(call['entry_valuation'])}\n"
+        f"💰 <b>{metric} נוכחי:</b> {_fmt_usd(current_valuation)}\n"
+        f"📈 <b>רווח/הפסד נוכחי:</b> {current_profit:+.1f}%\n"
+        f"🏆 <b>ATH מאז ההמלצה:</b> {_fmt_usd(ath)}\n"
+        f"🕒 <b>הומלץ:</b> {_format_call_time_israel(call['call_time'])}\n\n"
+        "ℹ️ <i>הטריגר להתראה הוא זינוק בווליום בלבד; המחיר לא חייב להיות בעלייה בזמן הזיהוי.</i>\n"
+        "⚠️ <i>זינוק בווליום עשוי להקדים תנועה חדה, אך אינו מבטיח עליית מחיר.</i>"
+    )
+
+
+async def _publish_momentum_alert(
+    application: Application,
+    pool,
+    call,
+    *,
+    current_price: float | None,
+    current_valuation: float,
+    current_profit: float,
+    volume_m5_usd: float,
+    volume_change_1m: float | None,
+    volume_change_5m: float | None,
+    dex_url: str | None,
+) -> bool:
+    try:
+        cooldown = max(5, int(os.getenv("MOMENTUM_COOLDOWN_MINUTES", "30")))
+    except ValueError:
+        cooldown = 30
+
+    alert_id = await db.claim_momentum_alert(
+        pool,
+        call_id=int(call["id"]),
+        cooldown_minutes=cooldown,
+        volume_change_1m_percent=volume_change_1m,
+        volume_change_5m_percent=volume_change_5m,
+        volume_m5_usd=volume_m5_usd,
+        observed_price=current_price,
+        observed_valuation=current_valuation,
+        observed_profit_percent=current_profit,
+    )
+    if alert_id is None:
+        return False
+
+    try:
+        keyboard = await stats.recommendation_keyboard(
+            application,
+            pool,
+            channel_chat_id=int(call["channel_chat_id"]),
+            dex_url=dex_url or call["current_dexscreener_url"] or call["dexscreener_url"],
+        )
+        rows = [list(row) for row in keyboard.inline_keyboard]
+        original_url = _original_call_url(call)
+        if original_url:
+            rows.insert(1, [InlineKeyboardButton("🧾 להמלצה המקורית", url=original_url)])
+        keyboard = InlineKeyboardMarkup(rows)
+
+        sent = await application.bot.send_message(
+            chat_id=int(call["channel_chat_id"]),
+            text=_momentum_message(
+                call,
+                current_valuation=current_valuation,
+                current_profit=current_profit,
+                volume_m5_usd=volume_m5_usd,
+                volume_change_1m=volume_change_1m,
+                volume_change_5m=volume_change_5m,
+            ),
+            parse_mode="HTML",
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        logger.exception("Failed publishing momentum alert for call %s", call["id"])
+        await db.release_momentum_alert(pool, alert_id=alert_id)
+        return False
+
+    await db.finalize_momentum_alert(
+        pool,
+        alert_id=alert_id,
+        telegram_message_id=sent.message_id,
+    )
+    return True
+
+
 # ---------- Live loop ----------
 
 
@@ -766,6 +893,7 @@ async def check_calls_once(application: Application) -> None:
 
                 current_price = _to_float(pair.get("priceUsd"))
                 current_valuation = _to_float(pair.get(call["valuation_type"]))
+                current_volume_m5 = _to_float((pair.get("volume") or {}).get("m5")) or 0.0
 
                 if current_valuation is None or current_valuation <= 0:
                     logger.warning(
@@ -789,11 +917,65 @@ async def check_calls_once(application: Application) -> None:
                     observed_high_profit_percent=observed_high_profit,
                 )
 
-                if profit < 100:
-                    return
+                await db.record_price_snapshot(
+                    pool,
+                    call_id=int(call["id"]),
+                    price=current_price,
+                    valuation=current_valuation,
+                    volume_m5_usd=current_volume_m5,
+                )
 
-                milestone = int(profit // 100) * 100
-                if milestone <= int(call["highest_milestone"] or 0):
+                one_ref, five_ref = await db.get_momentum_reference_values(
+                    pool,
+                    call_id=int(call["id"]),
+                )
+
+                def ref_volume(ref):
+                    if ref is None:
+                        return None
+                    return _to_float(ref["volume_m5_usd"])
+
+                volume_change_1m = _percent_change(current_volume_m5, ref_volume(one_ref))
+                volume_change_5m = _percent_change(current_volume_m5, ref_volume(five_ref))
+
+                try:
+                    threshold_1m = float(os.getenv("VOLUME_SPIKE_1M_PERCENT", "50"))
+                except ValueError:
+                    threshold_1m = 50.0
+                try:
+                    threshold_5m = float(os.getenv("VOLUME_SPIKE_5M_PERCENT", "100"))
+                except ValueError:
+                    threshold_5m = 100.0
+                try:
+                    min_volume_m5 = float(os.getenv("VOLUME_SPIKE_MIN_5M_USD", "1000"))
+                except ValueError:
+                    min_volume_m5 = 1000.0
+
+                milestone = int(profit // 100) * 100 if profit >= 100 else 0
+                has_new_milestone = milestone > int(call["highest_milestone"] or 0)
+
+                momentum_triggered = current_volume_m5 >= min_volume_m5 and (
+                    (volume_change_1m is not None and volume_change_1m >= threshold_1m)
+                    or (volume_change_5m is not None and volume_change_5m >= threshold_5m)
+                )
+
+                # Avoid two near-identical posts in the same cycle: if a new
+                # 100% milestone was just reached, the milestone post wins.
+                if momentum_triggered and not has_new_milestone:
+                    await _publish_momentum_alert(
+                        application,
+                        pool,
+                        call,
+                        current_price=current_price,
+                        current_valuation=current_valuation,
+                        current_profit=profit,
+                        volume_m5_usd=current_volume_m5,
+                        volume_change_1m=volume_change_1m,
+                        volume_change_5m=volume_change_5m,
+                        dex_url=dex_url,
+                    )
+
+                if not has_new_milestone:
                     return
 
                 await _publish_milestone(
@@ -815,6 +997,10 @@ async def check_calls_once(application: Application) -> None:
                 logger.exception("Live tracker failed on call %s", call["id"])
 
     await asyncio.gather(*(check_one(call) for call in calls))
+    try:
+        await db.prune_price_snapshots(pool)
+    except Exception:
+        logger.exception("Could not prune old momentum snapshots")
 
 
 async def live_tracker_loop(application: Application) -> None:
