@@ -28,3 +28,13 @@ The alert shows:
 Database migration
 ------------------
 Stage 20 safely adds volume fields to the existing snapshot and alert tables. No calls or historical data are deleted.
+
+
+UPDATE - absolute volume crossing trigger
+-----------------------------------------
+Volume alerts no longer use percentage-growth thresholds. The live tracker now
+alerts only when rolling 5-minute volume crosses upward from below $10,000 to
+$10,000 or more between consecutive tracker samples. Configure the threshold with:
+VOLUME_ALERT_THRESHOLD_USD=10000
+
+MOMENTUM_COOLDOWN_MINUTES defaults to 0 because each below-to-above crossing is already a distinct event. Set it higher only if you want to suppress repeated crossings.
